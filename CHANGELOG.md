@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.9.1] - 2026-09-29
+
+### Fixed
+
+- **会话格式 v3+ 下回复丢失（PR #4）**：宿主不再把 `assistant/chunk` 写入会话日志，而 `session/event` 只广播被 append 的事件，插件据此累积的正文恒为空，微信侧每轮只能收到 `DSH 无返回内容。`。改为记录本轮的 `assistant/message` 正文，在 `turn/end` 时（宿主未推送任何增量）作为单个 chunk 补发；宿主恢复增量下发时自动走原流式路径。
+- **会话 id 非 path-safe 导致投影缓存写入被拒（PR #5）**：会话 id 由 `${botAccountId}::${userId}` 派生，账号/用户 id 自带的 `@` 与 `.` 被保留，不符合存储层 per-record key 的 `/^[a-zA-Z0-9_-]+$/`，`session_projcache` 每次 checkpoint 写入都被拒（日志每约 6 秒刷一条警告）。清洗规则收紧为只保留 `[A-Za-z0-9_-]`。存量会话 id 仍按原值续用，老会话的警告不会自动消失；迁移会话目录与 `workspace.json` 引用属于另一项改动。
+
+### Changed
+
+- **回复回传改为整轮兜底（PR #4）**：宿主不再下发增量期间没有逐段输出，且只回传本轮最后一条 assistant 消息正文——有工具调用的多步轮次，中间步骤的叙述文本不下发。恢复逐段流式已列入 `docs/future-plan.md`。
+- `README.md` 的「流式回复」条目对齐实际回传行为。
+
 ## [0.9.0] - 2026-08-30
 
 ### Added
