@@ -28,6 +28,7 @@
 | 电脑休眠不中断（preventSleep） | feasibility 已列未做；"装上不用管"核心体验 |
 | 消息队列进阶 | 优先级队列、失败重试状态可见、风控自动降速 + 提示 |
 | daemon 独立 DSH SDK runtime | daemon 独立于宿主进程，可单独重启/自愈 |
+| 恢复逐段流式回传 | 会话格式 v3+ 宿主不再下发 `assistant/chunk`（现为整轮兜底，多步轮次丢中间叙述）；改走 `dsh-client-connection` 的 `text-chunks` 或宿主增量订阅 API |
 
 ## P2 · 长期（扩张，愿景驱动）
 
