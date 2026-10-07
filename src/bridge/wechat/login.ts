@@ -1,188 +1,90 @@
 import type { AccountData } from './accounts.js';
 import { DEFAULT_BASE_URL, saveAccount } from './accounts.js';
-import { logger } from '../logger.js';
+import { isPlausibleUserId } from '../trust.js';
+import { requestLoginJson } from './login-transport.js';
+import { WechatLoginError, safeLoginFailure } from './login-errors.js';
 
 const QR_CODE_URL = `${DEFAULT_BASE_URL}/ilink/bot/get_bot_qrcode?bot_type=3`;
 const QR_STATUS_URL = `${DEFAULT_BASE_URL}/ilink/bot/get_qrcode_status`;
-const POLL_INTERVAL_MS = 3_000;
-
-interface QrCodeResponse {
-  ret: number;
-  qrcode?: string;
-  qrcode_img_content?: string;
-}
-
-interface QrStatusResponse {
-  ret: number;
-  status: string;
-  retmsg?: string;
-  bot_token?: string;
-  ilink_bot_id?: string;
-  baseurl?: string;
-  ilink_user_id?: string;
-}
-
 export type QrCheckResult =
   | { status: 'wait' | 'scaned' }
   | { status: 'confirmed'; account: AccountData }
   | { status: 'expired'; message: string }
   | { status: 'error'; message: string; retryable: boolean };
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function text(value: unknown, maximum = 8192): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= maximum;
 }
-
-/** Phase 1: Request a QR code for login. Returns the URL and ID. */
+function accepted(data: Record<string, unknown>): boolean {
+  return !Object.hasOwn(data, 'ret') || data.ret === 0;
+}
+export function parseQrStartResponse(data: Record<string, unknown>): { qrcodeUrl: string; qrcodeId: string } {
+  if (!accepted(data)) throw new WechatLoginError('rejected');
+  if (!text(data.qrcode_img_content) || !text(data.qrcode, 4096) || /[\u0000-\u0020\u007f]/.test(data.qrcode)) throw new WechatLoginError('malformed');
+  return { qrcodeUrl: data.qrcode_img_content, qrcodeId: data.qrcode };
+}
 export async function startQrLogin(): Promise<{ qrcodeUrl: string; qrcodeId: string }> {
-  logger.info('Requesting QR code');
-
-  const res = await fetch(QR_CODE_URL);
-  if (!res.ok) {
-    throw new Error(`Failed to get QR code: HTTP ${res.status}`);
+  // Fresh login only: never enumerate or transmit tokens from other accounts.
+  return parseQrStartResponse(await requestLoginJson(QR_CODE_URL, 15_000, JSON.stringify({ local_token_list: [] })));
+}
+function accountBaseUrl(value: unknown): string {
+  if (value === undefined) return DEFAULT_BASE_URL;
+  if (!text(value)) throw new WechatLoginError('malformed');
+  const url = new URL(value);
+  if (url.protocol !== 'https:' || url.username || url.password || url.port || url.search || url.hash || url.pathname !== '/' ||
+      !(url.hostname === 'weixin.qq.com' || url.hostname.endsWith('.weixin.qq.com'))) throw new WechatLoginError('redirect');
+  return url.origin;
+}
+/** Validate before committing; Host supplies its current request/lifetime guard.
+ * Raw server text, QR identifiers and credentials never enter error messages.
+ */
+export function parseQrStatusResponse(data: Record<string, unknown>, dataDir?: string, canCommit: () => boolean = () => true): QrCheckResult {
+  if (!accepted(data)) return { status: 'error', message: '微信拒绝了此次扫码请求，请重新获取二维码。', retryable: false };
+  if (data.status === 'wait' || data.status === 'scaned') return { status: data.status };
+  if (data.status === 'expired') return { status: 'expired', message: '二维码已过期，请重新获取。' };
+  if (data.status === 'confirmed') {
+    if (!text(data.bot_token) || !text(data.ilink_bot_id, 128) || !text(data.ilink_user_id, 64) || !isPlausibleUserId(data.ilink_user_id)) {
+      return { status: 'error', message: '微信确认信息不完整，未保存授权，请重新绑定。', retryable: false };
+    }
+    let baseUrl: string;
+    try { baseUrl = accountBaseUrl(data.baseurl); } catch {
+      return { status: 'error', message: '微信返回了不允许的服务地址，未保存授权。', retryable: false };
+    }
+    const account: AccountData = {
+      botToken: data.bot_token, accountId: data.ilink_bot_id, userId: data.ilink_user_id,
+      baseUrl, createdAt: new Date().toISOString(),
+    };
+    if (!canCommit()) return { status: 'expired', message: '本机扫码请求已结束，未保存授权，请重新获取二维码。' };
+    saveAccount(account, dataDir);
+    return { status: 'confirmed', account };
   }
-
-  const data = (await res.json()) as QrCodeResponse;
-
-  if (data.ret !== 0 || !data.qrcode_img_content || !data.qrcode) {
-    throw new Error(`Failed to get QR code (ret=${data.ret})`);
-  }
-
-  logger.info('QR code obtained', { qrcodeId: data.qrcode });
-
-  return {
-    qrcodeUrl: data.qrcode_img_content,
-    qrcodeId: data.qrcode,
+  const unsupported: Record<string, string> = {
+    need_verifycode: '微信要求填写手机配对码；当前预览版尚不支持这一步。请勿把配对码发送到聊天中。',
+    verify_code_blocked: '微信暂时限制了配对码尝试，请稍后重新获取二维码。',
+    scaned_but_redirect: '微信要求切换登录节点；当前预览版不自动跟随，以避免泄露扫码凭据。',
+    binded_redirect: '微信提示已有绑定，但未返回本次授权；本机不会据此宣称绑定成功。',
   };
+  return { status: 'error', message: typeof data.status === 'string' && Object.hasOwn(unsupported, data.status)
+    ? unsupported[data.status] : '微信返回了当前版本不支持的扫码状态，请重新获取二维码。', retryable: false };
 }
-
-/**
- * Check one QR-code status without blocking. Saves the account on success.
- * This is the non-blocking building block used both by the terminal setup
- * loop and by the Web settings panel polling.
- */
-export async function checkQrStatus(qrcodeId: string): Promise<QrCheckResult> {
-  const url = `${QR_STATUS_URL}?qrcode=${encodeURIComponent(qrcodeId)}`;
-
-  logger.debug('Checking QR status', { qrcodeId });
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5_000);
-  let res: Response;
+export async function checkQrStatus(qrcodeId: string, dataDir?: string, canCommit?: () => boolean): Promise<QrCheckResult> {
+  if (!text(qrcodeId, 4096)) return { status: 'error', message: '无效的扫码请求。', retryable: false };
+  let data: Record<string, unknown>;
   try {
-    res = await fetch(url, { signal: controller.signal });
-  } catch (e: any) {
-    clearTimeout(timer);
-    const isTimeout = e?.name === 'AbortError' || e?.code === 'ETIMEDOUT';
-    return {
-      status: 'error',
-      message: isTimeout ? 'QR poll timed out' : (e?.message ?? String(e)),
-      retryable: true,
-    };
+    data = await requestLoginJson(`${QR_STATUS_URL}?qrcode=${encodeURIComponent(qrcodeId)}`, 35_000);
+  } catch (error) {
+    return { status: 'error', message: error instanceof WechatLoginError ? safeLoginFailure(error) : '二维码状态暂不可用，请稍后重试。',
+      retryable: !(error instanceof WechatLoginError) || ['network', 'timeout', 'http'].includes(error.kind) };
   }
-  clearTimeout(timer);
-
-  if (!res.ok) {
-    return {
-      status: 'error',
-      message: `Failed to check QR status: HTTP ${res.status}`,
-      retryable: false,
-    };
-  }
-
-  const data = (await res.json()) as QrStatusResponse;
-  logger.debug('QR status response', { status: data.status });
-
-  switch (data.status) {
-    case 'wait':
-    case 'scaned':
-      return { status: data.status };
-
-    case 'confirmed': {
-      if (!data.bot_token || !data.ilink_bot_id || !data.ilink_user_id) {
-        return {
-          status: 'error',
-          message: 'QR confirmed but missing required fields in response',
-          retryable: false,
-        };
-      }
-
-      const accountData: AccountData = {
-        botToken: data.bot_token,
-        accountId: data.ilink_bot_id,
-        baseUrl: data.baseurl || DEFAULT_BASE_URL,
-        userId: data.ilink_user_id,
-        createdAt: new Date().toISOString(),
-      };
-
-      saveAccount(accountData);
-      logger.info('QR login successful', { accountId: accountData.accountId });
-
-      return { status: 'confirmed', account: accountData };
-    }
-
-    case 'expired': {
-      logger.info('QR code expired');
-      return { status: 'expired', message: 'QR code expired' };
-    }
-
-    default: {
-      logger.warn('Unknown QR status', { status: data.status, retmsg: data.retmsg });
-      // Surface error to user for known failure statuses
-      const status = data.status ?? '';
-      if (status && (
-        status.includes('not_support') ||
-        status.includes('version') ||
-        status.includes('forbid') ||
-        status.includes('reject') ||
-        status.includes('cancel')
-      )) {
-        return {
-          status: 'error',
-          message: `二维码扫描失败: ${data.retmsg || status}`,
-          retryable: false,
-        };
-      }
-      if (data.retmsg) {
-        return {
-          status: 'error',
-          message: `二维码扫描失败: ${data.retmsg}`,
-          retryable: false,
-        };
-      }
-      // Unknown but not fatal: keep waiting.
-      return { status: 'wait' };
-    }
-  }
+  return parseQrStatusResponse(data, dataDir, canCommit);
 }
-
-/**
- * Phase 2: Wait for the user to scan and confirm the QR code.
- * Throws on expiry so the caller can regenerate the QR image.
- * Returns the full AccountData on success.
- */
-export async function waitForQrScan(qrcodeId: string): Promise<AccountData> {
-  while (true) {
-    const result = await checkQrStatus(qrcodeId);
-
-    switch (result.status) {
-      case 'confirmed':
-        return result.account;
-
-      case 'expired':
-        throw new Error(result.message);
-
-      case 'error':
-        if (result.retryable) {
-          logger.info('QR status check failed, retrying', { message: result.message });
-          await sleep(POLL_INTERVAL_MS);
-          continue;
-        }
-        throw new Error(result.message);
-
-      default:
-        break;
-    }
-
-    await sleep(POLL_INTERVAL_MS);
+export async function waitForQrScan(qrcodeId: string, dataDir?: string): Promise<AccountData> {
+  const deadline = Date.now() + 5 * 60_000;
+  while (Date.now() < deadline) {
+    const result = await checkQrStatus(qrcodeId, dataDir, () => Date.now() < deadline);
+    if (result.status === 'confirmed') return result.account;
+    if (result.status === 'expired' || (result.status === 'error' && !result.retryable)) throw new Error(result.message);
+    await new Promise(resolve => setTimeout(resolve, 3000));
   }
+  throw new Error('二维码等待超时，请重新获取。');
 }

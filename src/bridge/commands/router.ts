@@ -57,7 +57,10 @@ export async function routeCommand(ctx: CommandContext): Promise<CommandResult> 
   const cmd = (spaceIdx === -1 ? text.slice(1) : text.slice(1, spaceIdx)).toLowerCase();
   const args = spaceIdx === -1 ? '' : text.slice(spaceIdx + 1).trim();
 
-  logger.info(`Slash command: /${cmd} ${args}`.trimEnd());
+  logger.info('Slash command received', { command: cmd, argumentLength: args.length });
+  if (['trust', 'distrust', 'untrust', 'trustmode'].includes(cmd)) {
+    return { handled: true, reply: '此便携预览版仅供扫码绑定者本人使用，不支持添加其他用户。' };
+  }
 
   switch (cmd) {
     case 'help':

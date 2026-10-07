@@ -1,13 +1,14 @@
 import { fileURLToPath } from 'node:url'
 import type { UserConfig } from 'tsdown'
 
-const PLUGIN_ID = "@lanbaolu/dsh-wechat-bridge"
+const PLUGIN_ID = 'dsh-wechat-portable'
 
 const CLIENT_EXTERNALS = [
   'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client',
   'cordis',
   '@deepseek-ai/dsh-client-ui-slots',
-  '@deepseek-ai/dsh-client-runtime/client',
+  '@deepseek-ai/cordis',
+  '@deepseek-ai/dsh-api-remotes/client',
 ]
 
 const clientBundle: UserConfig = {
@@ -16,7 +17,7 @@ const clientBundle: UserConfig = {
   format: 'cjs',
   platform: 'browser',
   dts: false,
-  sourcemap: true,
+  sourcemap: false,
   clean: false,
   define: {
     'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV ?? 'production'),

@@ -19,6 +19,8 @@ import { loadConfig, saveConfig, type CalmConfig } from './config.js';
 import { loadJson, saveJson } from './store.js';
 import { logger } from './logger.js';
 import { DATA_DIR } from './constants.js';
+import { validateOutboundFile } from './safe-files.js';
+import { ensurePrivateDir } from '../portable/paths.js';
 import { MessageType, type WeixinMessage } from './wechat/types.js';
 import { loadPendingQueue, savePendingQueue, appendPending, type PendingItem } from './pending-queue.js';
 import { DshClient, type DshStreamEvent } from './dsh-client.js';
@@ -96,17 +98,10 @@ function contextTokensPath(): string {
 
 function persistContextTokens(): void {
   try {
-    mkdirSync(DATA_DIR, { recursive: true });
     const tokens: Record<string, string> = {};
     for (const [k, v] of contextTokens) tokens[k] = v;
-    writeFileSync(contextTokensPath(), JSON.stringify({ tokens, updatedAt: Date.now() }) + '\n', 'utf8');
-    // 旧单 token 文件继续写（最近一条），老版本工具/排查脚本仍可读。
-    writeFileSync(contextTokenPath(), JSON.stringify({ token: lastContextToken, updatedAt: Date.now() }) + '\n', 'utf8');
-    // 敏感 token 文件与 trust/config 对齐 0600，避免同机其他用户可读。
-    if (process.platform !== 'win32') {
-      chmodSync(contextTokensPath(), 0o600);
-      chmodSync(contextTokenPath(), 0o600);
-    }
+    saveJson(contextTokensPath(), { tokens, updatedAt: Date.now() });
+    saveJson(contextTokenPath(), { token: lastContextToken, updatedAt: Date.now() });
   } catch (err) {
     logger.warn('Failed to persist context tokens', { error: err instanceof Error ? err.message : String(err) });
   }
@@ -181,8 +176,7 @@ function isPidAlive(pid: number): boolean {
 
 function writePollLock(): void {
   try {
-    mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(POLL_LOCK_PATH, JSON.stringify({ pid: process.pid, heartbeat: Date.now() }) + '\n', 'utf8');
+    saveJson(POLL_LOCK_PATH, { pid: process.pid, heartbeat: Date.now() });
   } catch (err) {
     logger.warn('Failed to write poll lock', { error: err instanceof Error ? err.message : String(err) });
   }
@@ -431,7 +425,8 @@ async function runSetup(): Promise<void> {
     } else {
       const QRCode = await import('qrcode');
       const pngData = await QRCode.toBuffer(qrcodeUrl, { type: 'png', width: 400, margin: 2 });
-      writeFileSync(QR_PATH, pngData);
+      ensurePrivateDir(DATA_DIR);
+      writeFileSync(QR_PATH, pngData, { mode: 0o600 });
       openFile(QR_PATH);
       console.log('已打开二维码图片，请用微信扫描：');
       console.log(`图片路径: ${QR_PATH}\n`);
@@ -561,7 +556,12 @@ async function runDaemon(): Promise<void> {
       try {
         const parsed = JSON.parse(body) as { message?: unknown; userId?: unknown };
         const message = String(parsed?.message ?? '');
-        const targetUserId = typeof parsed?.userId === 'string' && parsed.userId ? parsed.userId : undefined;
+        const targetUserId = typeof parsed?.userId === 'string' && parsed.userId ? parsed.userId : account.userId;
+        if (!account.userId || targetUserId !== account.userId) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'owner only' }));
+          return;
+        }
         // 审批是阻塞交互且量极低（由用户自己的任务触发），绕过节流直发，
         // 否则 60s 的最小通知间隔会把审批拖到超时。
         if (isApproval) {
@@ -595,8 +595,7 @@ async function runDaemon(): Promise<void> {
   await new Promise<void>((resolve) => notifyServer.listen(0, '127.0.0.1', resolve));
   const notifyPort = (notifyServer.address() as { port: number }).port;
   try {
-    mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(notifyPortPath, JSON.stringify({ port: notifyPort, token: process.env.DSH_BRIDGE_API_TOKEN }, null, 2) + '\n', 'utf8');
+    saveJson(notifyPortPath, { port: notifyPort, token: process.env.DSH_BRIDGE_API_TOKEN });
     logger.info('Proactive notify endpoint ready', { port: notifyPort });
   } catch (err) {
     logger.warn('Failed to persist notify endpoint info', { error: err instanceof Error ? err.message : String(err) });
@@ -728,15 +727,21 @@ async function runDaemon(): Promise<void> {
       return false;
     }
     const text = extractTextFromItems(msg.item_list).trim();
-    const match = /^\/(yes|no)(?:\s|$)/i.exec(text);
-    if (!match) return false;
+    const match = /^\/(yes|no)\s+([a-f0-9]{16,64})$/i.exec(text);
+    if (!match) {
+      if (/^\/(yes|no)(?:\s|$)/i.test(text)) {
+        await sender.sendText(msg.from_user_id!, msg.context_token ?? '', '请完整回复审批消息中的 /yes <审批码> 或 /no <审批码>；不带有效审批码不会授予权限。').catch(() => {});
+        return true;
+      }
+      return false;
+    }
     const approved = match[1].toLowerCase() === 'yes';
     const userId = msg.from_user_id!;
     const sessionKey = sessionStore.keyFor(userId);
 
     let reply: string;
     try {
-      const result = await client.decideApproval(sessionKey, approved);
+      const result = await client.decideApproval(sessionKey, approved, match[2]);
       if (result.ok) {
         reply = approved
           ? `✅ 已批准${result.toolName ? `：${result.toolName}` : ''}，任务继续执行。`
@@ -769,6 +774,8 @@ async function runDaemon(): Promise<void> {
 
       // P1-2 / M1：信任门禁——优先命令与审批回复也受门禁约束（在门禁之后处理）。
       if (msg.message_type === MessageType.USER && msg.from_user_id) {
+        // This portable alpha is single-user, regardless of legacy trust-file settings.
+        if (!account.userId || msg.from_user_id !== account.userId) return;
         if (checkTrustGate(msg) !== null) return;
         // 受信用户的每条入站消息都刷新该用户的 context_token（主动推送通行证）。
         if (msg.context_token) {
@@ -807,6 +814,7 @@ async function runDaemon(): Promise<void> {
       if (item.role !== 'final') continue;
       try {
         const target = item.userId || account.userId || '';
+        if (!account.userId || target !== account.userId) continue;
         await sender.sendText(target, contextTokenFor(target), item.text);
         logger.info('Pending queue item delivered', { accountId: account.accountId, target });
       } catch (err) {
@@ -947,7 +955,7 @@ async function handleMessage(
     }
 
     if (result.handled && result.sendFile) {
-      await sender.sendFile(fromUserId, contextToken, result.sendFile);
+      await sender.sendFile(fromUserId, contextToken, validateOutboundFile(result.sendFile, session.workingDirectory || config.workingDirectory));
       return;
     }
 
@@ -1040,7 +1048,7 @@ async function sendToDsh(
       files,
     });
 
-    if (!accepted) {
+    if (!accepted.accepted) {
       await sender.sendText(fromUserId, contextToken, '消息已收到，但 DSH 未接受处理请求。');
       session.state = 'idle';
       sessionStore.save(fromUserId, session);
@@ -1065,7 +1073,9 @@ async function sendToDsh(
     const STREAM_STALL_MS = 2500;
     let lastChunkTime = Date.now();
 
-    const flush = async (maxChars?: number): Promise<void> => {
+    let flushChain = Promise.resolve();
+    const flush = (maxChars?: number): Promise<void> => {
+      flushChain = flushChain.then(async () => {
       if (!pendingSend) return;
       let text: string;
       if (maxChars !== undefined) {
@@ -1086,6 +1096,8 @@ async function sendToDsh(
           return;
         }
       }
+      });
+      return flushChain;
     };
 
     flushTimer = setInterval(() => {
@@ -1128,6 +1140,7 @@ async function sendToDsh(
     }, 2000);
 
     const controller = new AbortController();
+    try {
     await client.stream(sessionKey, (event: DshStreamEvent) => {
       switch (event.type) {
         case 'chunk':
@@ -1146,18 +1159,32 @@ async function sendToDsh(
           break;
         case 'error':
           if (event.message) {
-            finalText += `\n\n⚠️ ${event.message}`;
+            const warning = `\n\n⚠️ ${event.message}`;
+            finalText += warning;
+            pendingSend += warning;
           }
           break;
         case 'done':
           // 流结束：记录本轮用量（供尾注），剩余缓冲由下方 flush 兜底。
           if (event.usage) turnUsage = event.usage;
+          if (event.terminal && event.terminal !== 'completed' && event.message) {
+            const notice = `\n\nℹ️ ${event.message}`;
+            finalText += notice;
+            pendingSend += notice;
+          }
           break;
       }
     }, controller.signal);
 
-    if (flushTimer) clearInterval(flushTimer);
-    if (keepaliveTimer) clearInterval(keepaliveTimer);
+    } catch {
+      const warning = '\n\n⚠️ 回复连接中断或超过 30 分钟。请检查电脑端状态；任务仍在运行时可发送 /stop。';
+      finalText += warning;
+      pendingSend += warning;
+    } finally {
+      if (flushTimer) clearInterval(flushTimer);
+      if (keepaliveTimer) clearInterval(keepaliveTimer);
+      controller.abort();
+    }
 
     // 上下文用量尾注：inputTokens + cacheReadTokens ≈ 当前上下文大小。
     // 并入最后一段缓冲一起发，不额外产生消息（config.json 可关：usageFooter=false）。
@@ -1191,25 +1218,8 @@ async function sendToDsh(
     const resultText = finalText.trim();
     if (resultText) {
       sessionStore.addChatMessage(session, 'assistant', resultText);
-      if (!resultText.startsWith('⚠️')) {
-        // Auto-push deliverable files mentioned in DSH's response.
-        const cwd = (session.workingDirectory || config.workingDirectory).replace(/^~/, homedir());
-        const detectedPaths = extractFilePathsFromText(resultText, cwd);
-        const pushable = detectedPaths.filter(f => {
-          const ext = extname(f).toLowerCase();
-          return AUTO_PUSH_EXTENSIONS.has(ext) && existsSync(f);
-        });
-        for (const filePath of pushable) {
-          try {
-            await sender.sendFile(fromUserId, contextToken, filePath);
-          } catch (err) {
-            logger.warn('Failed to auto-push file', {
-              filePath,
-              error: err instanceof Error ? err.message : String(err),
-            });
-          }
-        }
-      }
+      // Never upload arbitrary paths merely mentioned by the model. The owner
+      // must explicitly request /send; its final upload boundary confines files.
     } else {
       await sender.sendText(fromUserId, contextToken, 'DSH 无返回内容。');
     }

@@ -1,906 +1,198 @@
 import type * as React from 'react'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { SettingsSectionOwnerProps } from '@deepseek-ai/dsh-client-ui-settings/client'
+import type { ControlSetup, ControlStatus } from '../host/contract.js'
+import type { ControlClient } from './remote.js'
 
-const API_BASE = '/@lanbaolu/dsh-wechat-bridge'
-
-const panelStyle = {
-  padding: '14px 16px',
-  fontFamily: 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif',
-  fontSize: 13,
-  lineHeight: 1.6,
-  color: 'var(--text-1, #1f2328)',
-  background: 'var(--surface-2, rgba(127,127,127,.06))',
-  border: '1px solid var(--border-color, rgba(127,127,127,.18))',
-  borderRadius: 10,
-  margin: '8px 0',
-  // DSH 宿主不使用 --text-1/--surface-2 等通用变量名（实际变量体系为 --dsw-alias-*），
-  // 导致深色主题下文字永远 fallback 到黑色 #1f2328，几乎不可读。
-  // 在面板根元素上把用到的变量映射到宿主真实变量，深浅主题自动跟随。
-  // @types/react 18 的 CSSProperties 不含 CSS 自定义属性键，故用交叉类型断言。
-  '--text-1': 'var(--dsw-alias-label-primary, #1f2328)',
-  '--surface-2': 'var(--dsw-alias-bg-module-platform, rgba(127,127,127,.06))',
-  '--surface-3': 'var(--dsw-alias-bg-layer-2, rgba(0,0,0,.04))',
-  '--border-color': 'var(--dsw-alias-border-l2, rgba(127,127,127,.18))',
-  '--button-bg': 'var(--dsw-alias-bg-layer-1, #fff)',
-} as React.CSSProperties &
-  Record<'--text-1' | '--surface-2' | '--surface-3' | '--border-color' | '--button-bg', string>
-
-const titleStyle: React.CSSProperties = {
-  fontWeight: 600,
-  fontSize: 14,
-  marginBottom: 8,
+const panelStyle: React.CSSProperties = {
+  padding: 16, borderRadius: 10, fontSize: 13, lineHeight: 1.6,
+  color: 'var(--dsw-alias-label-primary, #1f2328)',
+  background: 'var(--dsw-alias-bg-module-platform, rgba(127,127,127,.06))',
+  border: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,.18))',
 }
-
-const outputStyle: React.CSSProperties = {
-  margin: '4px 0 8px',
-  padding: '8px 10px',
-  background: 'var(--surface-3, rgba(0,0,0,.04))',
-  border: '1px solid var(--border-color, rgba(127,127,127,.15))',
-  borderRadius: 6,
-  whiteSpace: 'pre-wrap',
-  wordBreak: 'break-all',
-  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-  fontSize: 12,
-  maxHeight: 360,
-  overflow: 'auto',
-}
-
-const buttonRowStyle: React.CSSProperties = {
-  display: 'flex',
-  gap: 8,
-  flexWrap: 'wrap',
-  alignItems: 'center',
-}
-
+const rowStyle: React.CSSProperties = { display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', margin: '10px 0' }
 const buttonStyle: React.CSSProperties = {
-  padding: '4px 10px',
-  border: '1px solid var(--border-color, rgba(127,127,127,.4))',
-  borderRadius: 6,
-  background: 'var(--button-bg, #fff)',
-  color: 'var(--text-1, inherit)',
-  cursor: 'pointer',
-  fontSize: 12,
+  padding: '5px 12px', borderRadius: 6, cursor: 'pointer', color: 'inherit',
+  background: 'var(--dsw-alias-bg-layer-1, transparent)',
+  border: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,.4))',
 }
-
 const inputStyle: React.CSSProperties = {
-  padding: '4px 8px',
-  border: '1px solid var(--border-color, rgba(127,127,127,.4))',
-  borderRadius: 6,
-  background: 'var(--surface-3, rgba(127,127,127,.06))',
-  color: 'var(--text-1, inherit)',
-  fontSize: 12,
-  minWidth: 220,
+  ...buttonStyle, cursor: 'text', minWidth: 200, width: 'min(100%, 540px)', boxSizing: 'border-box',
 }
+const hintStyle: React.CSSProperties = { fontSize: 12, opacity: 0.75 }
+const errorStyle: React.CSSProperties = { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', color: 'var(--dsw-alias-label-danger, #c44848)' }
 
-const selectStyle: React.CSSProperties = {
-  ...inputStyle,
-  minWidth: 320,
-  maxWidth: '100%',
-}
+export interface WechatBridgePanelProps extends SettingsSectionOwnerProps { control: ControlClient }
 
-const hintStyle: React.CSSProperties = {
-  marginTop: 8,
-  fontSize: 12,
-  opacity: 0.7,
-}
-
-/** 折叠分组：把面板拆成可收起的区块，降低设置页复杂度。 */
-function Section({ title, defaultOpen = false, children }: { title: string; defaultOpen?: boolean; children: React.ReactNode }) {
-  return (
-    <details
-      open={defaultOpen}
-      style={{
-        marginBottom: 10,
-        border: '1px solid var(--border-color, rgba(127,127,127,.18))',
-        borderRadius: 8,
-        padding: '8px 10px',
-      }}
-    >
-      <summary style={{ fontWeight: 600, fontSize: 13, cursor: 'pointer', userSelect: 'none' }}>{title}</summary>
-      <div style={{ marginTop: 8 }}>{children}</div>
-    </details>
-  )
-}
-
-type SetupPhase = 'idle' | 'starting' | 'qr' | 'confirmed' | 'error'
-
-interface ProjectSessionItem {
-  sessionId: string
-  workspaceId: string
-  workspaceTitle: string
-  path: string
-  cwd?: string
-  createdAt: string
-  live: boolean
-}
-
-interface SelectedProjectInfo {
-  sessionId: string
-  workspaceId: string
-  workspaceTitle: string
-  path: string
-}
-
-interface NotifyStatus {
-  dailySent: number
-  dailyLimit: number
-  hourlySent: number
-  hourlyLimit: number
-  pendingCount: number
-  queueCapacity: number
-}
-
-interface TrustedUser {
-  userId: string
-  addedAt: string
-  by: 'owner' | 'bootstrap' | 'restore'
-  lastSeenAt?: number
-  note?: string
-}
-
-interface TrustInfo {
-  mode: 'owner-only' | 'bootstrap' | 'manual'
-  bootstrapConsumed: boolean
-  owner: string
-  notifyRejected: boolean
-  trusted: TrustedUser[]
-}
-
-const TRUST_MODE_LABELS: Record<TrustInfo['mode'], string> = {
-  'owner-only': '仅本机主人（默认）',
-  bootstrap: '首位陌生人自动入集（一次性）',
-  manual: '仅手动添加的人',
-}
-
-/** 超时安抚配置的面板编辑态（分钟用字符串便于输入，保存时转换）。 */
-interface CalmUiState {
-  enabled: boolean
-  silenceMin: string
-  intervalMin: string
-  maxCount: string
-  messages: string
-}
-
-const CALM_DEFAULTS: CalmUiState = { enabled: true, silenceMin: '5', intervalMin: '5', maxCount: '0', messages: '' }
-
-function calmFromConfig(calm?: { enabled?: boolean; silenceMs?: number; intervalMs?: number; maxCount?: number; messages?: string[] }): CalmUiState {
-  return {
-    enabled: calm?.enabled !== false,
-    silenceMin: calm?.silenceMs && calm.silenceMs > 0 ? String(Math.round(calm.silenceMs / 60000)) : '5',
-    intervalMin: calm?.intervalMs && calm.intervalMs > 0 ? String(Math.round(calm.intervalMs / 60000)) : '5',
-    maxCount: calm?.maxCount !== undefined ? String(calm.maxCount) : '0',
-    messages: calm?.messages?.length ? calm.messages.join('\n') : '',
-  }
-}
-
-function calmToConfig(ui: CalmUiState): { enabled: boolean; silenceMs?: number; intervalMs?: number; maxCount?: number; messages?: string[] } {
-  const toMin = (v: string): number | undefined => {
-    const n = Number(v)
-    return Number.isFinite(n) && n > 0 ? Math.round(n * 60000) : undefined
-  }
-  const maxCount = Number(ui.maxCount)
-  const messages = ui.messages.split('\n').map((s) => s.trim()).filter(Boolean)
-  return {
-    enabled: ui.enabled,
-    silenceMs: toMin(ui.silenceMin),
-    intervalMs: toMin(ui.intervalMin),
-    maxCount: Number.isFinite(maxCount) && maxCount >= 0 ? Math.round(maxCount) : undefined,
-    messages: messages.length > 0 ? messages : undefined,
-  }
-}
-
-function formatTime(ms?: number): string {
-  if (!ms) return '从未活跃'
-  try {
-    return new Date(ms).toLocaleString('zh-CN')
-  } catch {
-    return '未知'
-  }
-}
-
-export function WechatBridgePanel(_props: SettingsSectionOwnerProps): React.JSX.Element {
-  const [output, setOutput] = useState('加载中…')
-  const [error, setError] = useState<string | null>(null)
-  const [busy, setBusy] = useState<string | null>(null)
-  const [workingDir, setWorkingDir] = useState('')
-  const [setupPhase, setSetupPhase] = useState<SetupPhase>('idle')
-  const [qrcodeDataUrl, setQrcodeDataUrl] = useState('')
-  const [qrcodeId, setQrcodeId] = useState('')
-  const [setupError, setSetupError] = useState('')
-  const [boundAccountId, setBoundAccountId] = useState('')
-  const [daemonMessage, setDaemonMessage] = useState('')
-  const [projects, setProjects] = useState<ProjectSessionItem[]>([])
-  const [projectChoice, setProjectChoice] = useState('')
-  const [boundProject, setBoundProject] = useState<SelectedProjectInfo | null>(null)
-  const [projectBusy, setProjectBusy] = useState(false)
-  const [projectMessage, setProjectMessage] = useState('')
-  const [projectError, setProjectError] = useState('')
-  const [notifyStatus, setNotifyStatus] = useState<NotifyStatus | null>(null)
-  const [pendingStatus, setPendingStatus] = useState<{ count: number; chars: number; oldestQueuedAt: number | null } | null>(null)
-  const [calm, setCalm] = useState<CalmUiState>(CALM_DEFAULTS)
-  const [preventSleep, setPreventSleep] = useState(false)
-  const [calmBusy, setCalmBusy] = useState(false)
-  const [calmMessage, setCalmMessage] = useState('')
-  const [calmError, setCalmError] = useState('')
-  const [trust, setTrust] = useState<TrustInfo | null>(null)
-  const [trustBusy, setTrustBusy] = useState(false)
-  const [trustMessage, setTrustMessage] = useState('')
-  const [trustError, setTrustError] = useState('')
-  const [newTrustId, setNewTrustId] = useState('')
-  const [newTrustNote, setNewTrustNote] = useState('')
+/** Single-owner alpha panel. QR secrets live only in component memory, never in exports/storage/logs. */
+export function WechatBridgePanel({ control }: WechatBridgePanelProps): React.JSX.Element {
+  const [status, setStatus] = useState<ControlStatus | null>(null)
+  const [workingDirectory, setWorkingDirectory] = useState('')
+  const [busy, setBusy] = useState('')
+  const [error, setError] = useState('')
+  const [statusError, setStatusError] = useState('')
+  const [message, setMessage] = useState('')
+  const [qr, setQr] = useState<ControlSetup | null>(null)
+  const [qrMessage, setQrMessage] = useState('')
+  const mounted = useRef(false)
+  const busyRef = useRef(false)
+  const refreshInFlight = useRef(false)
+  const qrId = useRef('')
+  const epoch = useRef(0)
 
   const refresh = useCallback(async () => {
+    if (refreshInFlight.current) return
+    refreshInFlight.current = true
     try {
-      const [statusRes, projectsRes, notifyRes] = await Promise.all([
-        fetch(`${API_BASE}/status`, { cache: 'no-store' }),
-        fetch(`${API_BASE}/projects`, { cache: 'no-store' }),
-        fetch(`${API_BASE}/notify/status`, { cache: 'no-store' }),
-      ])
-      if (!statusRes.ok) throw new Error(`status HTTP ${statusRes.status}`)
-      if (!projectsRes.ok) throw new Error(`projects HTTP ${projectsRes.status}`)
-      const data = await statusRes.json()
-      const projectsData = await projectsRes.json()
-      const notifyData = await notifyRes.json().catch(() => null)
-      if (notifyData && typeof notifyData === 'object' && typeof (notifyData as { data?: NotifyStatus }).data?.dailyLimit === 'number') {
-        setNotifyStatus((notifyData as { data: NotifyStatus }).data)
-      } else if (notifyData && typeof (notifyData as NotifyStatus).dailyLimit === 'number') {
-        setNotifyStatus(notifyData as NotifyStatus)
-      }
-      setOutput(JSON.stringify(data, null, 2))
-      if (typeof data.workingDirectory === 'string') {
-        setWorkingDir((prev) => prev || data.workingDirectory)
-      }
-      setBoundProject(data.selectedProject ?? null)
-      if (Array.isArray(projectsData.items)) {
-        setProjects(projectsData.items as ProjectSessionItem[])
-      }
-      setError(null)
+      const next = await control.status()
+      if (!mounted.current) return
+      setStatus(next)
+      setWorkingDirectory((previous) => previous || next.workingDirectory)
+      setStatusError('')
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    }
-    // 待补发队列（发送失败暂存）单独拉取
-    try {
-      const pendingRes = await fetch(`${API_BASE}/pending/status`, { cache: 'no-store' })
-      if (pendingRes.ok) {
-        const pendingData = await pendingRes.json()
-        if (pendingData && typeof pendingData === 'object' && pendingData.ok) {
-          setPendingStatus(pendingData.data ?? null)
-        }
-      }
-    } catch {
-      // ignore
-    }
-    // 信任集单独拉取（失败不影响主状态展示）
-    try {
-      const trustRes = await fetch(`${API_BASE}/trust`, { cache: 'no-store' })
-      if (trustRes.ok) {
-        const trustData = await trustRes.json()
-        if (trustData && typeof trustData === 'object' && trustData.ok) {
-          setTrust(trustData as TrustInfo)
-        }
-      }
-    } catch {
-      // ignore
-    }
-    // 桥接配置（超时安抚等）单独拉取，避免被初次渲染的默认值覆盖
-    try {
-      const cfgRes = await fetch(`${API_BASE}/config`, { cache: 'no-store' })
-      if (cfgRes.ok) {
-        const cfgData = await cfgRes.json()
-        if (cfgData && typeof cfgData === 'object' && cfgData.ok) {
-          setCalm(calmFromConfig(cfgData.calm))
-          setPreventSleep(cfgData.preventSleep === true)
-        }
-      }
-    } catch {
-      // ignore
-    }
-  }, [])
-
-  async function changePreventSleep(enabled: boolean): Promise<void> {
-    setCalmBusy(true)
-    setCalmError('')
-    setCalmMessage('')
-    try {
-      const res = await fetch(`${API_BASE}/config`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ preventSleep: enabled }),
-      })
-      const data = await res.json().catch(() => null)
-      if (!res.ok || !data?.ok) {
-        throw new Error(data?.error || `HTTP ${res.status}`)
-      }
-      setPreventSleep(enabled)
-      setCalmMessage(enabled ? '已开启防休眠：守护进程运行期间抑制系统休眠，重启 daemon 后生效。' : '已关闭防休眠。')
-    } catch (err) {
-      setCalmError(err instanceof Error ? err.message : String(err))
-      setPreventSleep(!enabled)
-    } finally {
-      setCalmBusy(false)
-    }
-  }
-
-  async function saveCalm(): Promise<void> {
-    setCalmBusy(true)
-    setCalmError('')
-    setCalmMessage('')
-    try {
-      const res = await fetch(`${API_BASE}/config`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ calm: calmToConfig(calm) }),
-      })
-      const data = await res.json().catch(() => null)
-      if (!res.ok || !data?.ok) {
-        throw new Error(data?.error || `HTTP ${res.status}`)
-      }
-      setCalmMessage('已保存，下次安抚时生效（最长延迟数秒）。')
-    } catch (err) {
-      setCalmError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setCalmBusy(false)
-    }
-  }
+      if (mounted.current) setStatusError(err instanceof Error ? err.message : '无法读取原生 IPC 状态')
+    } finally { refreshInFlight.current = false }
+  }, [control])
 
   useEffect(() => {
+    mounted.current = true
     void refresh()
-  }, [refresh])
-
-  async function run(path: string): Promise<void> {
-    setBusy(path)
-    setError(null)
-    try {
-      const res = await fetch(`${API_BASE}/${path}`, { method: 'POST' })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json()
-      setOutput(JSON.stringify(data, null, 2))
-      await refresh()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setBusy(null)
+    const timer = setInterval(() => { void refresh() }, 5000)
+    return () => {
+      mounted.current = false
+      epoch.current++
+      clearInterval(timer)
+      const id = qrId.current
+      qrId.current = ''
+      if (id) void control.cancelSetup(id).catch(() => {})
     }
-  }
-
-  async function showLogs(): Promise<void> {
-    setBusy('logs')
-    setError(null)
-    try {
-      const res = await fetch(`${API_BASE}/logs`, { cache: 'no-store' })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      setOutput(await res.text())
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setBusy(null)
-    }
-  }
-
-  async function startSetup(): Promise<void> {
-    setSetupPhase('starting')
-    setSetupError('')
-    try {
-      const res = await fetch(`${API_BASE}/setup/start`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ workingDirectory: workingDir || undefined }),
-      })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json()
-      if (!data.ok) throw new Error(data.message || data.error || '启动扫码绑定失败')
-      setQrcodeDataUrl(data.qrcodeDataUrl)
-      setQrcodeId(data.qrcodeId)
-      setWorkingDir(data.workingDirectory || workingDir)
-      setSetupPhase('qr')
-    } catch (err) {
-      setSetupPhase('error')
-      setSetupError(err instanceof Error ? err.message : String(err))
-    }
-  }
-
-  async function bindProject(): Promise<void> {
-    if (!projectChoice) return
-    setProjectBusy(true)
-    setProjectError('')
-    setProjectMessage('')
-    try {
-      const res = await fetch(`${API_BASE}/projects/select`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId: projectChoice }),
-      })
-      const data = await res.json().catch(() => null)
-      if (!res.ok || !data?.ok) {
-        throw new Error(data?.error || data?.message || `HTTP ${res.status}`)
-      }
-      const project = data.project as SelectedProjectInfo | undefined
-      setProjectMessage(`已绑定项目会话${project?.workspaceTitle ? `：${project.workspaceTitle}` : ''}${data.daemon ? `（${data.daemon}）` : ''}`)
-      await refresh()
-    } catch (err) {
-      setProjectError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setProjectBusy(false)
-    }
-  }
-
-  async function detachProject(): Promise<void> {
-    setProjectBusy(true)
-    setProjectError('')
-    setProjectMessage('')
-    try {
-      const res = await fetch(`${API_BASE}/projects/detach`, { method: 'POST' })
-      const data = await res.json().catch(() => null)
-      if (!res.ok || !data?.ok) {
-        throw new Error(data?.error || data?.message || `HTTP ${res.status}`)
-      }
-      setProjectMessage(`已解除项目会话绑定${data.daemon ? `（${data.daemon}）` : ''}`)
-      setProjectChoice('')
-      await refresh()
-    } catch (err) {
-      setProjectError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setProjectBusy(false)
-    }
-  }
-
-  // ---- 信任集管理（P1-2 / M4）----
-
-  function applyTrustResponse(data: TrustInfo & { ok?: boolean; error?: string }): void {
-    if (data.ok === false) throw new Error(data.error || '操作失败')
-    setTrust({
-      mode: data.mode,
-      bootstrapConsumed: data.bootstrapConsumed,
-      owner: data.owner,
-      notifyRejected: data.notifyRejected,
-      trusted: Array.isArray(data.trusted) ? data.trusted : [],
-    })
-  }
-
-  async function trustRequest(path: string, body: Record<string, unknown>, okMessage: string): Promise<void> {
-    setTrustBusy(true)
-    setTrustError('')
-    setTrustMessage('')
-    try {
-      const res = await fetch(`${API_BASE}/${path}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      })
-      const data = await res.json().catch(() => null)
-      if (!res.ok || !data?.ok) {
-        throw new Error(data?.error || `HTTP ${res.status}`)
-      }
-      applyTrustResponse(data as TrustInfo & { ok?: boolean; error?: string })
-      setTrustMessage(okMessage)
-    } catch (err) {
-      setTrustError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setTrustBusy(false)
-    }
-  }
-
-  async function addTrustedUser(): Promise<void> {
-    const id = newTrustId.trim()
-    if (!id) return
-    await trustRequest('trust/add', { userId: id, note: newTrustNote.trim() || undefined }, `已添加：${id}`)
-    setNewTrustId('')
-    setNewTrustNote('')
-  }
-
-  function removeTrustedUser(userId: string): void {
-    if (!window.confirm(`确认吊销 ${userId}？其后续消息将被拒绝，已有会话历史保留。`)) return
-    void trustRequest('trust/remove', { userId }, `已吊销：${userId}`)
-  }
-
-  function changeTrustMode(mode: TrustInfo['mode']): void {
-    void trustRequest('trust/config', { mode }, `信任模式已切换为：${TRUST_MODE_LABELS[mode]}`)
-  }
-
-  function toggleNotifyRejected(enabled: boolean): void {
-    void trustRequest('trust/config', { notifyRejected: enabled }, enabled ? '已开启陌生人联系提醒' : '已关闭陌生人联系提醒')
-  }
+  }, [control, refresh])
 
   useEffect(() => {
-    if (setupPhase !== 'qr' || !qrcodeId) return
-
+    if (!qr) return
     let cancelled = false
-    let timer: number | undefined
-
-    async function poll(): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const deadline = Date.now() + 5 * 60_000
+    const poll = async () => {
+      if (cancelled || !mounted.current) return
       try {
-        const res = await fetch(`${API_BASE}/setup/status?qrcodeId=${encodeURIComponent(qrcodeId)}`, { cache: 'no-store' })
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        const data = await res.json()
-        if (cancelled) return
-
-        if (data.status === 'confirmed') {
-          setSetupPhase('confirmed')
-          setBoundAccountId(data.accountId || '')
-          setDaemonMessage(data.daemon || '')
+        if (Date.now() >= deadline) throw new Error('二维码已超时，请重新获取。')
+        const result = await control.pollSetup(qr.qrcodeId)
+        if (cancelled || !mounted.current) return
+        setQrMessage(result.message || (result.status === 'scaned' ? '已扫码，请在微信确认。' : '等待扫码…'))
+        if (result.status === 'confirmed') {
+          qrId.current = ''
+          setQr(null)
+          setMessage('绑定成功。请手动启动桥接；权限审批保持原设置。')
           void refresh()
           return
         }
-
-        if (data.status === 'expired' || (data.status === 'error' && !data.retryable)) {
-          setSetupPhase('error')
-          setSetupError(data.message || '绑定失败，请重试')
+        if (result.status === 'expired' || result.status === 'idle' || (result.status === 'error' && !result.retryable)) {
+          qrId.current = ''
+          setQr(null)
           return
         }
-
-        timer = window.setTimeout(() => void poll(), 3000)
+        timer = setTimeout(() => { void poll() }, 3000)
       } catch (err) {
-        if (!cancelled) {
-          setSetupPhase('error')
-          setSetupError(err instanceof Error ? err.message : String(err))
-        }
+        if (cancelled || !mounted.current) return
+        qrId.current = ''
+        setQr(null)
+        setQrMessage(err instanceof Error ? err.message : '扫码状态读取失败，请重试。')
+        void control.cancelSetup(qr.qrcodeId).catch(() => {})
       }
     }
+    timer = setTimeout(() => { void poll() }, 1000)
+    return () => { cancelled = true; if (timer) clearTimeout(timer) }
+  }, [qr, control, refresh])
 
-    void poll()
-    return () => {
-      cancelled = true
-      if (timer) window.clearTimeout(timer)
+  async function run(label: string, operation: () => Promise<string>): Promise<void> {
+    if (busyRef.current) return
+    busyRef.current = true
+    setBusy(label)
+    setError('')
+    setMessage('')
+    const generation = epoch.current
+    try {
+      const text = await operation()
+      if (!mounted.current || generation !== epoch.current) return
+      setMessage(text)
+      await refresh()
+    } catch (err) {
+      if (mounted.current && generation === epoch.current) setError(err instanceof Error ? err.message : '原生控制失败')
+    } finally {
+      busyRef.current = false
+      if (mounted.current) setBusy('')
     }
-  }, [setupPhase, qrcodeId, refresh])
-
-  function cancelSetup(): void {
-    setSetupPhase('idle')
-    setQrcodeDataUrl('')
-    setQrcodeId('')
-    setSetupError('')
-    setDaemonMessage('')
   }
 
-  const actions: Array<{ label: string; run: () => void; disabled?: boolean }> = [
-    { label: '刷新状态', run: () => void refresh() },
-    { label: '扫码绑定', run: () => void startSetup(), disabled: setupPhase === 'starting' || setupPhase === 'qr' },
-    { label: '启动', run: () => void run('start'), disabled: busy !== null },
-    { label: '停止', run: () => void run('stop'), disabled: busy !== null },
-    { label: '重启', run: () => void run('restart'), disabled: busy !== null },
-    { label: '查看日志', run: () => void showLogs(), disabled: busy !== null },
-  ]
+  async function beginSetup(): Promise<void> {
+    const generation = epoch.current
+    await run('获取二维码', async () => {
+      const next = await control.startSetup(workingDirectory.trim() || undefined)
+      if (!mounted.current || generation !== epoch.current) {
+        void control.cancelSetup(next.qrcodeId).catch(() => {})
+        return ''
+      }
+      qrId.current = next.qrcodeId
+      setQr(next)
+      setQrMessage('请使用本机主人微信扫码，并在微信中确认。')
+      return ''
+    })
+  }
 
+  function cancelSetup(): void {
+    const id = qrId.current
+    qrId.current = ''
+    epoch.current++
+    setQr(null)
+    setQrMessage('本地二维码已隐藏，已停止后续轮询。')
+    if (id) void control.cancelSetup(id).catch(() => {})
+  }
+
+  const disabled = !!busy || !status?.ready || !!qr
   return (
-    <div style={panelStyle} role="region" aria-label="DSH 微信桥接管理面板">
-      <div style={titleStyle}>📱 DSH 微信桥接</div>
-
-      {error && <div role="alert" style={{ color: '#e5484d', marginBottom: 8 }}>{error}</div>}
-
-      <Section title="⚙️ 状态与操作" defaultOpen>
-        <div style={buttonRowStyle}>
-          {actions.map((action) => (
-            <button
-              key={action.label}
-              type="button"
-              style={buttonStyle}
-              disabled={action.disabled ?? false}
-              onClick={action.run}
-            >
-              {action.label}
-            </button>
-          ))}
-        </div>
-        <details style={{ marginTop: 8 }}>
-          <summary style={{ fontSize: 12, opacity: 0.7, cursor: 'pointer' }}>状态 / 日志输出</summary>
-          <pre style={{ ...outputStyle, marginTop: 6 }} aria-live="polite">{output}</pre>
-        </details>
-      </Section>
-
-      <Section title="🔗 连接与账号">
-        <label style={{ display: 'block', marginBottom: 8, fontSize: 12 }}>
-          DSH 工作目录
-          <input
-            type="text"
-            value={workingDir}
-            onChange={(e) => setWorkingDir(e.target.value)}
-            placeholder="例如 ~/Documents/DSH"
-            style={{ ...inputStyle, marginLeft: 8 }}
-          />
-        </label>
-
-      <div style={{ marginBottom: 12 }}>
-        <div style={{ ...titleStyle, marginBottom: 4 }}>项目对话绑定</div>
-        <div style={{ fontSize: 12, opacity: 0.8 }}>
-          {boundProject
-            ? `当前绑定：${boundProject.workspaceTitle} · ${boundProject.path} · ${boundProject.sessionId.slice(-8)}`
-            : '当前未绑定：微信消息使用独立桥接会话（也可选择项目对话以共享记忆）。'}
-        </div>
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginTop: 6 }}>
-          <select
-            value={projectChoice}
-            onChange={(e) => setProjectChoice(e.target.value)}
-            style={selectStyle}
-            aria-label="选择要绑定的项目会话"
-          >
-            <option value="">— 选择要绑定的项目会话 —</option>
-            {projects.map((project) => (
-              <option key={project.sessionId} value={project.sessionId}>
-                {project.workspaceTitle} · {project.path} · {project.sessionId.slice(-8)}
-              </option>
-            ))}
-          </select>
-          <button type="button" style={buttonStyle} disabled={!projectChoice || projectBusy} onClick={() => void bindProject()}>
-            绑定
-          </button>
-          <button type="button" style={buttonStyle} disabled={projectBusy || !boundProject} onClick={() => void detachProject()}>
-            解除绑定
-          </button>
-        </div>
-        {projectMessage && (
-          <div role="status" style={{ color: '#2f9e44', marginTop: 6, fontSize: 12 }}>{projectMessage}</div>
-        )}
-        {projectError && (
-          <div role="alert" style={{ color: '#e5484d', marginTop: 6, fontSize: 12 }}>{projectError}</div>
-        )}
-        </div>
-      </Section>
-
-      <Section title="💬 消息与通知">
-      <div style={{ marginBottom: 12 }}>
-        <div style={{ ...titleStyle, marginBottom: 4 }}>主动通知节流</div>
-        {notifyStatus ? (
-          <div style={{ fontSize: 12, opacity: 0.85 }}>
-            今日已发 <strong>{notifyStatus.dailySent}</strong> / {notifyStatus.dailyLimit} 条 · 近一小时{' '}
-            <strong>{notifyStatus.hourlySent}</strong> / {notifyStatus.hourlyLimit} 条 · 排队中{' '}
-            <strong>{notifyStatus.pendingCount}</strong> 条
-            <div style={{ marginTop: 4, fontSize: 12, opacity: 0.7 }}>
-              agent 通过 wechat_notify 主动推送的通知，超限自动排队延迟发送，避免触发微信风控。
-            </div>
-          </div>
-        ) : (
-          <div style={{ fontSize: 12, opacity: 0.7 }}>守护进程未运行，暂无数据。</div>
-        )}
+    <section style={panelStyle} aria-label="Portable 微信桥接">
+      <h3 style={{ marginTop: 0 }}>微信桥接 · 单用户 Alpha.4</h3>
+      <p style={hintStyle}>通过 DSH 原生 Remote / Desktop IPC 管理当前 profile，不使用浏览器 HTTP 后备接口。</p>
+      <div aria-live="polite">
+        {status ? <>
+          <div>桥接：{status.running ? '运行中' : '已停止'}{status.pid ? `（PID ${status.pid}）` : ''}</div>
+          <div>微信：{status.paired ? '已绑定主人账号' : '未绑定'} · 仅主人可用 · 活跃会话：{status.activeSessions}</div>
+          {!status.ready && <div>Host 正在初始化，请稍后刷新。</div>}
+        </> : <div>正在读取状态…</div>}
       </div>
-
-      <div style={{ marginBottom: 12 }}>
-        <div style={{ ...titleStyle, marginBottom: 4 }}>📮 待补发队列</div>
-        {pendingStatus && pendingStatus.count > 0 ? (
-          <div style={{ fontSize: 12 }}>
-            有 <strong style={{ color: '#b7791f' }}>{pendingStatus.count}</strong> 条消息发送失败待补发（共 {pendingStatus.chars} 字），daemon 会启动/定时自动重试。
-            {pendingStatus.oldestQueuedAt
-              ? ` 最早入队 ${new Date(pendingStatus.oldestQueuedAt).toLocaleString('zh-CN')}`
-              : ''}
-          </div>
-        ) : (
-          <div style={{ fontSize: 12, opacity: 0.7 }}>
-            {pendingStatus ? '无待补发消息（发送失败会自动暂存并在 daemon 重启/定时时补发）。' : '守护进程未运行，暂无数据。'}
-          </div>
-        )}
+      <div style={rowStyle}>
+        <button style={buttonStyle} disabled={disabled || status?.running || !status?.paired} onClick={() => void run('启动', async () => (await control.start()).message)}>启动</button>
+        <button style={buttonStyle} disabled={disabled || !status?.running} onClick={() => void run('停止', async () => (await control.stop()).message)}>停止</button>
+        <button style={buttonStyle} disabled={disabled || !status?.paired} onClick={() => void run('重启', async () => (await control.restart()).message)}>重启</button>
+        <button style={buttonStyle} disabled={!!busy} onClick={() => void refresh()}>刷新</button>
+        {busy && <span role="status">{busy}…</span>}
       </div>
-
-      <div style={{ marginBottom: 12 }}>
-        <div style={{ ...titleStyle, marginBottom: 4 }}>⏳ 超时安抚</div>
-        <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 8 }}>
-          DSH 长时间没有产出消息时，主动发一条"还在处理"的安抚消息。改配置后即时生效（最长延迟数秒）。
-        </div>
-        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, marginBottom: 8 }}>
-          <input
-            type="checkbox"
-            checked={calm.enabled}
-            onChange={(e) => setCalm((c) => ({ ...c, enabled: e.target.checked }))}
-          />
-          启用安抚消息
-        </label>
-        <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center', marginBottom: 8 }}>
-          <label style={{ fontSize: 12 }}>
-            首次静默（分钟）
-            <input
-              type="number"
-              min={1}
-              value={calm.silenceMin}
-              onChange={(e) => setCalm((c) => ({ ...c, silenceMin: e.target.value }))}
-              style={{ ...inputStyle, marginLeft: 6, minWidth: 70 }}
-            />
-          </label>
-          <label style={{ fontSize: 12 }}>
-            重复间隔（分钟）
-            <input
-              type="number"
-              min={1}
-              value={calm.intervalMin}
-              onChange={(e) => setCalm((c) => ({ ...c, intervalMin: e.target.value }))}
-              style={{ ...inputStyle, marginLeft: 6, minWidth: 70 }}
-            />
-          </label>
-          <label style={{ fontSize: 12 }}>
-            每轮上限（次，0=不限）
-            <input
-              type="number"
-              min={0}
-              value={calm.maxCount}
-              onChange={(e) => setCalm((c) => ({ ...c, maxCount: e.target.value }))}
-              style={{ ...inputStyle, marginLeft: 6, minWidth: 70 }}
-            />
-          </label>
-        </div>
-        <label style={{ fontSize: 12, display: 'block', marginBottom: 6 }}>
-          自定义文案（每行一条，留空用内置默认；每次随机取一条）
-          <textarea
-            value={calm.messages}
-            onChange={(e) => setCalm((c) => ({ ...c, messages: e.target.value }))}
-            rows={3}
-            style={{
-              ...inputStyle,
-              display: 'block',
-              marginTop: 4,
-              minWidth: '100%',
-              boxSizing: 'border-box',
-              resize: 'vertical',
-              fontFamily: 'inherit',
-            }}
-          />
-        </label>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          <button type="button" style={buttonStyle} disabled={calmBusy} onClick={() => void saveCalm()}>
-            保存安抚设置
-          </button>
-          {calmMessage && <span role="status" style={{ color: '#2f9e44', fontSize: 12 }}>{calmMessage}</span>}
-          {calmError && <span role="alert" style={{ color: '#e5484d', fontSize: 12 }}>{calmError}</span>}
-        </div>
+      <hr style={{ opacity: 0.2 }} />
+      <label htmlFor="wechat-portable-workspace">默认工作目录</label>
+      <div style={rowStyle}>
+        <input id="wechat-portable-workspace" style={inputStyle} value={workingDirectory} disabled={!!busy || !!qr}
+          autoComplete="off" spellCheck={false} placeholder="本机已有目录的绝对路径"
+          onChange={(event) => setWorkingDirectory(event.target.value)} />
+        <button style={buttonStyle} disabled={disabled || !workingDirectory.trim()} onClick={() => void run('保存目录', async () => {
+          const result = await control.setWorkspace(workingDirectory)
+          if (mounted.current) setWorkingDirectory(result.workingDirectory)
+          return result.message
+        })}>保存目录</button>
       </div>
-      </Section>
-
-      <Section title="⚡ 系统行为">
-      <div style={{ marginBottom: 12 }}>
-        <div style={{ ...titleStyle, marginBottom: 4 }}>💤 防休眠</div>
-        <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 8 }}>
-          守护进程运行期间抑制系统休眠（锁屏/合盖不挂起，微信消息持续响应）。macOS 用 caffeinate、Linux 用 systemd-inhibit、Windows 尽力而为。
-        </div>
-        <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
-          <input
-            type="checkbox"
-            checked={preventSleep}
-            disabled={calmBusy}
-            onChange={(e) => void changePreventSleep(e.target.checked)}
-          />
-          启用防休眠（重启守护进程后生效）
-        </label>
+      <p style={hintStyle}>首次使用请先创建此目录或选择已有文件夹；保存不会创建目录。已有会话和权限策略不变，变更目录后请重启桥接并新建会话。</p>
+      <hr style={{ opacity: 0.2 }} />
+      <h4>扫码绑定</h4>
+      <p style={hintStyle}>请先停止桥接并等待活跃会话结束。绑定不会自动启动桥接。二维码包含登录秘密，请勿分享或截图导出。</p>
+      <div style={rowStyle}>
+        <button style={buttonStyle} disabled={disabled || status?.running || !!status?.activeSessions} onClick={() => void beginSetup()}>获取绑定二维码</button>
+        {qr && <button style={buttonStyle} onClick={cancelSetup}>隐藏二维码 / 停止轮询</button>}
       </div>
-      </Section>
-
-      <Section title="🔐 多用户与安全">
-      <div style={{ marginBottom: 12 }}>
-        <div style={{ ...titleStyle, marginBottom: 4 }}>🔐 信任用户（多用户）</div>
-        {!trust ? (
-          <div style={{ fontSize: 12, opacity: 0.7 }}>加载中…</div>
-        ) : (
-          <>
-            <div style={{ fontSize: 12, opacity: 0.85, marginBottom: 6 }}>
-              信任模式
-              <select
-                value={trust.mode}
-                onChange={(e) => changeTrustMode(e.target.value as TrustInfo['mode'])}
-                disabled={trustBusy}
-                style={{ ...inputStyle, marginLeft: 8, minWidth: 240 }}
-                aria-label="选择信任模式"
-              >
-                <option value="owner-only">{TRUST_MODE_LABELS['owner-only']}</option>
-                <option value="bootstrap">{TRUST_MODE_LABELS.bootstrap}</option>
-                <option value="manual">{TRUST_MODE_LABELS.manual}</option>
-              </select>
-            </div>
-            {trust.mode === 'bootstrap' && trust.bootstrapConsumed && (
-              <div style={{ fontSize: 12, color: '#b7791f', marginBottom: 6 }}>
-                ⚠️ bootstrap 首次名额已用完，后续陌生人不会再自动入集，请用下方表单手动添加或切到 manual。
-              </div>
-            )}
-            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, marginBottom: 8 }}>
-              <input
-                type="checkbox"
-                checked={trust.notifyRejected}
-                disabled={trustBusy}
-                onChange={(e) => toggleNotifyRejected(e.target.checked)}
-              />
-              陌生人尝试联系时向 owner 推送提醒
-            </label>
-            <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 8 }}>
-              owner：{trust.owner || '（未绑定）'} · 信任用户：{trust.trusted.length} 个
-            </div>
-            {trust.trusted.length > 0 && (
-              <div style={{ marginBottom: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
-                {trust.trusted.map((u) => (
-                  <div
-                    key={u.userId}
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: 8,
-                      padding: '6px 8px',
-                      background: 'var(--surface-3, rgba(127,127,127,.05))',
-                      border: '1px solid var(--border-color, rgba(127,127,127,.12))',
-                      borderRadius: 6,
-                    }}
-                  >
-                    <span style={{ fontWeight: 600 }}>{u.userId}</span>
-                    {u.note && <span style={{ opacity: 0.7, fontSize: 12 }}>{u.note}</span>}
-                    <span style={{ marginLeft: 'auto', fontSize: 11, opacity: 0.6 }}>
-                      {u.by === 'bootstrap' ? '自动入集' : u.by === 'restore' ? '迁移导入' : '手动添加'} · {formatTime(u.lastSeenAt)}
-                    </span>
-                    <button
-                      type="button"
-                      style={{ ...buttonStyle, color: '#e5484d' }}
-                      disabled={trustBusy}
-                      onClick={() => removeTrustedUser(u.userId)}
-                    >
-                      吊销
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-              <input
-                type="text"
-                value={newTrustId}
-                onChange={(e) => setNewTrustId(e.target.value)}
-                placeholder="要添加的微信 userId"
-                style={{ ...inputStyle, minWidth: 180 }}
-              />
-              <input
-                type="text"
-                value={newTrustNote}
-                onChange={(e) => setNewTrustNote(e.target.value)}
-                placeholder="备注（可选）"
-                style={{ ...inputStyle, minWidth: 120 }}
-              />
-              <button type="button" style={buttonStyle} disabled={trustBusy || !newTrustId.trim()} onClick={() => void addTrustedUser()}>
-                添加信任
-              </button>
-            </div>
-            {trustMessage && <div role="status" style={{ color: '#2f9e44', marginTop: 6, fontSize: 12 }}>{trustMessage}</div>}
-            {trustError && <div role="alert" style={{ color: '#e5484d', marginTop: 6, fontSize: 12 }}>{trustError}</div>}
-             <div style={{ fontSize: 12, opacity: 0.7, marginTop: 8 }}>
-               信任用户与 owner 各自拥有独立会话、独立上下文，互不可见。撤销信任后其新消息将被拒绝，但已有历史保留。
-               修改信任模式后，新入站消息立即生效，无需重启。
-             </div>
-          </>
-        )}
-      </div>
-      </Section>
-
-      {setupPhase === 'starting' && (
-        <div role="status" style={{ marginBottom: 8 }}>正在生成二维码…</div>
-      )}
-
-      {setupPhase === 'qr' && qrcodeDataUrl && (
-        <div style={{ marginBottom: 8 }}>
-          <div style={{ fontWeight: 600, marginBottom: 4 }}>请用微信扫描下方二维码完成绑定</div>
-          <img
-            src={qrcodeDataUrl}
-            alt="微信扫码绑定二维码"
-            width={240}
-            height={240}
-            style={{ display: 'block', maxWidth: '100%', height: 'auto', borderRadius: 8, background: '#fff' }}
-          />
-          <div style={{ fontSize: 12, opacity: 0.7, marginTop: 4 }}>
-            工作目录：{workingDir || '未设置'}。等待扫码确认中…
-          </div>
-          <button type="button" style={{ ...buttonStyle, marginTop: 8 }} onClick={cancelSetup}>
-            取消绑定
-          </button>
-        </div>
-      )}
-
-      {setupPhase === 'confirmed' && (
-        <div role="status" style={{ marginBottom: 8, color: '#2f9e44' }}>
-          ✅ 绑定成功{boundAccountId ? `：${boundAccountId}` : ''}，{daemonMessage || '桥接已自动重启/启动。'}
-        </div>
-      )}
-
-      {setupPhase === 'error' && (
-        <div role="alert" style={{ marginBottom: 8, color: '#e5484d' }}>
-          ❌ {setupError}
-          <button type="button" style={{ ...buttonStyle, marginLeft: 8 }} onClick={() => setSetupPhase('idle')}>
-            重新扫码
-          </button>
-        </div>
-      )}
-
-      <div style={hintStyle}>
-        也可在 DSH 对话中直接使用 wechat_bridge_setup / wechat_bridge_status / wechat_bridge_start / wechat_bridge_stop / wechat_bridge_logs 等工具。
-      </div>
-    </div>
+      {qr && <img src={qr.qrcodeDataUrl} alt="微信绑定二维码，仅供本机主人扫描" width={280} height={280}
+        draggable={false} style={{ display: 'block', maxWidth: '100%', height: 'auto' }} />}
+      {qrMessage && <p role="status">{qrMessage}</p>}
+      {message && <p role="status">{message}</p>}
+      {(error || statusError) && <p role="alert" style={errorStyle}>{error || statusError}</p>}
+    </section>
   )
 }

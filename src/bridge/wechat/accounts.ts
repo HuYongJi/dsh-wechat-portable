@@ -1,11 +1,9 @@
 import { join } from 'node:path';
-import { readdirSync, statSync } from 'node:fs';
+import { readdirSync, lstatSync } from 'node:fs';
 import { loadJson, saveJson, validateAccountId } from '../store.js';
-import { logger } from '../logger.js';
 import { DATA_DIR } from '../constants.js';
 
 export const DEFAULT_BASE_URL = 'https://ilinkai.weixin.qq.com';
-
 export interface AccountData {
   botToken: string;
   accountId: string;
@@ -13,52 +11,25 @@ export interface AccountData {
   userId: string;
   createdAt: string;
 }
-
-const ACCOUNTS_DIR = join(DATA_DIR, 'accounts');
-
-function accountPath(accountId: string): string {
+function accountPath(accountId: string, dataDir: string): string {
   validateAccountId(accountId);
-  return join(ACCOUNTS_DIR, `${accountId}.json`);
+  return join(dataDir, 'accounts', `${accountId}.json`);
 }
-
-/** Persist account credentials to disk. */
-export function saveAccount(data: AccountData): void {
-  const filePath = accountPath(data.accountId);
-  saveJson(filePath, data);
-  logger.info('Account saved', { accountId: data.accountId });
+export function saveAccount(data: AccountData, dataDir: string = DATA_DIR): void {
+  saveJson(accountPath(data.accountId, dataDir), data);
 }
-
-/** Load account credentials by ID. Returns null if not found. */
-export function loadAccount(accountId: string): AccountData | null {
-  const filePath = accountPath(accountId);
-  const data = loadJson<AccountData | null>(filePath, null);
-  if (data) {
-    logger.info('Account loaded', { accountId });
-  }
-  return data;
+export function loadAccount(accountId: string, dataDir: string = DATA_DIR): AccountData | null {
+  const path = accountPath(accountId, dataDir);
+  try { if (!lstatSync(path).isFile() || lstatSync(path).isSymbolicLink()) return null; } catch { return null; }
+  return loadJson<AccountData | null>(path, null);
 }
-
-/** Load the most recently modified account. Returns null if none exist. */
-export function loadLatestAccount(): AccountData | null {
+export function loadLatestAccount(dataDir: string = DATA_DIR): AccountData | null {
   try {
-    const files = readdirSync(ACCOUNTS_DIR).filter((f) => f.endsWith('.json'));
-    if (files.length === 0) return null;
-
-    let latestFile = files[0];
-    let latestMtime = 0;
-
-    for (const file of files) {
-      const stat = statSync(join(ACCOUNTS_DIR, file));
-      if (stat.mtimeMs > latestMtime) {
-        latestMtime = stat.mtimeMs;
-        latestFile = file;
-      }
-    }
-
-    const accountId = latestFile.replace(/\.json$/, '');
-    return loadAccount(accountId);
-  } catch {
-    // Directory does not exist or is unreadable
-    return null;
-  }
+    const folder = join(dataDir, 'accounts');
+    const files = readdirSync(folder).filter(name => name.endsWith('.json'))
+      .map(name => ({ name, stat: lstatSync(join(folder, name)) }))
+      .filter(item => item.stat.isFile() && !item.stat.isSymbolicLink())
+      .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
+    return files.length ? loadAccount(files[0].name.slice(0, -5), dataDir) : null;
+  } catch { return null; }
 }

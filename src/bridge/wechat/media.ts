@@ -1,6 +1,5 @@
 import path from 'node:path';
-import os from 'node:os';
-import fs from 'node:fs';
+import { saveInboundMedia } from '../safe-files.js';
 import type { MessageItem, ImageItem } from './types.js';
 import { MessageItemType } from './types.js';
 import { downloadAndDecrypt } from './cdn.js';
@@ -64,10 +63,7 @@ export async function downloadImage(item: MessageItem): Promise<string | null> {
     const decrypted = await downloadAndDecrypt(cdnData.encryptQueryParam, cdnData.aesKey);
     const mimeType = detectMimeType(decrypted);
     const ext = mimeType.split('/')[1] || 'png';
-    const tmpDir = path.join(os.tmpdir(), 'dsh-wechat-bridge');
-    fs.mkdirSync(tmpDir, { recursive: true });
-    const filePath = path.join(tmpDir, `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`);
-    fs.writeFileSync(filePath, decrypted);
+    const filePath = saveInboundMedia(decrypted, `image.${ext}`);
     logger.info('Image downloaded and saved', { path: filePath, size: decrypted.length });
     return filePath;
   } catch (err) {
@@ -133,10 +129,7 @@ export async function downloadVideo(item: MessageItem): Promise<string | null> {
 
   try {
     const decrypted = await downloadAndDecrypt(encryptQueryParam, aesKey);
-    const tmpDir = path.join(os.tmpdir(), 'dsh-wechat-bridge');
-    fs.mkdirSync(tmpDir, { recursive: true });
-    const filePath = path.join(tmpDir, `video-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.mp4`);
-    fs.writeFileSync(filePath, decrypted);
+    const filePath = saveInboundMedia(decrypted, 'video.mp4');
     logger.info('Video downloaded and saved', { path: filePath, size: decrypted.length });
     return filePath;
   } catch (err) {
@@ -172,11 +165,8 @@ export async function downloadFile(item: MessageItem): Promise<string | null> {
 
   try {
     const decrypted = await downloadAndDecrypt(encryptQueryParam, aesKey);
-    const tmpDir = path.join(os.tmpdir(), 'dsh-wechat-bridge');
-    fs.mkdirSync(tmpDir, { recursive: true });
-    const fileName = fileItem.file_name || `file-${Date.now()}.bin`;
-    const filePath = path.join(tmpDir, fileName);
-    fs.writeFileSync(filePath, decrypted);
+    const fileName = fileItem.file_name || 'attachment.bin';
+    const filePath = saveInboundMedia(decrypted, fileName);
     logger.info('File downloaded and saved', { path: filePath, size: decrypted.length, name: fileName });
     return filePath;
   } catch (err) {

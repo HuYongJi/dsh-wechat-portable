@@ -1,83 +1,34 @@
-import { mkdirSync, appendFileSync, readdirSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
-import { DATA_DIR } from "./constants.js";
+import { appendFileSync, readdirSync, unlinkSync } from 'node:fs';
+import { join } from 'node:path';
+import { DATA_DIR } from './constants.js';
+import { ensurePrivateDir } from '../portable/paths.js';
+const LOG_DIR = join(DATA_DIR, 'logs');
 
-const LOG_DIR = join(DATA_DIR, "logs");
-const MAX_LOG_FILES = 30; // Keep at most 30 days of logs
-
-/** Clean up old log files beyond MAX_LOG_FILES retention. */
-function cleanupOldLogs(): void {
-  try {
-    const files = readdirSync(LOG_DIR)
-      .filter((f) => f.startsWith("bridge-") && f.endsWith(".log"))
-      .sort();
-    while (files.length > MAX_LOG_FILES) {
-      unlinkSync(join(LOG_DIR, files.shift()!));
-    }
-  } catch {
-    // Ignore errors during cleanup
+/** Defense in depth only: logs are private state and must NEVER be shared by export. */
+export function redact(value: unknown): string {
+  const raw = typeof value === 'string' ? value : JSON.stringify(value);
+  if (!raw) return '';
+  return raw.replace(/Bearer\s+[^\s"\\]+/gi, 'Bearer ***')
+    .replace(/"[^"\n]*(?:token|secret|password|api_?key|aes_?key|qrcode)[^"\n]*"\s*:\s*"(?:\\.|[^"\\])*"/gi,
+      match => `${match.slice(0, match.indexOf(':'))}: "***"`);
+}
+function write(level: string, message: string, data?: unknown): void {
+  ensurePrivateDir(DATA_DIR);
+  ensurePrivateDir(LOG_DIR);
+  const files = readdirSync(LOG_DIR).filter(name => /^bridge-\d{4}-\d{2}-\d{2}\.log$/.test(name)).sort();
+  while (files.length > 30) {
+    // The name is positively matched, and the parent is the verified state log directory.
+    unlinkSync(join(LOG_DIR, files.shift()!));
   }
+  const now = new Date().toISOString();
+  const line = [now, level, redact(message), data === undefined ? '' : redact(data)].filter(Boolean).join(' ') + '\n';
+  appendFileSync(join(LOG_DIR, `bridge-${now.slice(0, 10)}.log`), line, { encoding: 'utf8', mode: 0o600 });
 }
-
-/**
- * Redact sensitive values from a string:
- * - Bearer tokens (Authorization headers)
- * - aes_key values
- * - generic token/secret values in JSON payloads
- */
-export function redact(obj: unknown): string {
-  const raw = typeof obj === "string" ? obj : JSON.stringify(obj);
-  if (!raw) return raw;
-
-  let safe = raw;
-  // Mask Bearer tokens: "Bearer <anything>"
-  safe = safe.replace(/Bearer\s+[^\s"\\]+/gi, "Bearer ***");
-  // Mask generic token/secret/password/api_key values in JSON
-  // Matches both snake_case (bot_token) and camelCase (botToken)
-  safe = safe.replace(
-    /"(?:(?:[\w]+_)?[Tt]oken|(?:[\w]+_)?[Ss]ecret|(?:[\w]+_)?[Pp]assword|(?:[\w]+_)?api_key|[Aa]es_[Kk]ey)"\s*:\s*"[^"]*"/gi,
-    (match) => {
-      const key = match.match(/"[^"]*"/)?.[0] ?? '""';
-      return `${key}: "***"`;
-    },
-  );
-  return safe;
-}
-
-function ensureLogDir(): void {
-  mkdirSync(LOG_DIR, { recursive: true });
-  cleanupOldLogs();
-}
-
-function getLogFilePath(): string {
-  const now = new Date(Date.now() + 8 * 60 * 60 * 1000);
-  const date = now.toISOString().slice(0, 10); // YYYY-MM-DD
-  return join(LOG_DIR, `bridge-${date}.log`);
-}
-
-function writeLogLine(level: string, message: string, data?: unknown): void {
-  ensureLogDir();
-  const ts = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString();
-  const timestamp = ts.replace('Z', '+08:00');
-  const parts = [timestamp, level, message];
-  if (data !== undefined) {
-    parts.push(redact(data));
-  }
-  const line = parts.join(" ") + "\n";
-  appendFileSync(getLogFilePath(), line, "utf-8");
-}
-
 export const logger = {
-  info(message: string, data?: unknown): void {
-    writeLogLine("INFO", message, data);
+  info: (message: string, data?: unknown) => write('INFO', message, data),
+  warn: (message: string, data?: unknown) => write('WARN', message, data),
+  error: (message: string, data?: unknown) => write('ERROR', message, data),
+  debug: (message: string, data?: unknown) => {
+    if (process.env.DSH_WECHAT_DEBUG === '1') write('DEBUG', message, data);
   },
-  warn(message: string, data?: unknown): void {
-    writeLogLine("WARN", message, data);
-  },
-  error(message: string, data?: unknown): void {
-    writeLogLine("ERROR", message, data);
-  },
-  debug(message: string, data?: unknown): void {
-    writeLogLine("DEBUG", message, data);
-  },
-} as const;
+};

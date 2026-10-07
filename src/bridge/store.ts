@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, chmodSync, mkdirSync, renameSync } from "node:fs";
 import { dirname } from "node:path";
 import { logger } from "./logger.js";
+import { atomicJson } from '../portable/paths.js';
 
 export function validateAccountId(accountId: string): void {
   if (!/^[a-zA-Z0-9_.@=-]+$/.test(accountId)) {
@@ -37,10 +38,5 @@ export function loadJson<T>(filePath: string, fallback: T): T {
  * File is written with mode 0o600 (owner read/write only).
  */
 export function saveJson(filePath: string, data: unknown): void {
-  mkdirSync(dirname(filePath), { recursive: true });
-  const raw = JSON.stringify(data, null, 2) + "\n";
-  writeFileSync(filePath, raw, "utf-8");
-  if (process.platform !== 'win32') {
-    chmodSync(filePath, 0o600);
-  }
+  atomicJson(filePath, data);
 }

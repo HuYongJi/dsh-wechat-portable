@@ -29,6 +29,7 @@ export interface DshStreamEvent {
   sessionId?: string;
   message?: string;
   turn?: number;
+  terminal?: string;
   usage?: DshStreamUsage;
 }
 
@@ -106,11 +107,12 @@ export class DshClient {
   async decideApproval(
     sessionId: string,
     approved: boolean,
+    approvalId: string,
   ): Promise<{ ok: boolean; reason?: string; toolName?: string }> {
     const res = await fetch(`${this.baseUrl}/api/approval/decide`, {
       method: 'POST',
       headers: this.headers(),
-      body: JSON.stringify({ sessionId, approved }),
+      body: JSON.stringify({ sessionId, approved, approvalId }),
       signal: AbortSignal.timeout(10_000),
     });
     if (!res.ok) {
@@ -171,42 +173,39 @@ export class DshClient {
     const url = new URL(`${this.baseUrl}/api/stream`);
     url.searchParams.set('sessionId', sessionId);
 
+    const deadline = AbortSignal.timeout(30 * 60_000);
     const res = await fetch(url, {
       headers: this.headers(),
-      signal,
+      signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
     });
-    if (!res.ok || !res.body) {
-      throw new Error(`stream HTTP ${res.status}`);
-    }
-
+    if (!res.ok || !res.body) throw new Error(`stream HTTP ${res.status}`);
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      // SSE events are separated by a blank line.
-      let sep: number;
-      while ((sep = buffer.indexOf('\n\n')) >= 0) {
-        const rawEvent = buffer.slice(0, sep);
-        buffer = buffer.slice(sep + 2);
-        for (const line of rawEvent.split('\n')) {
-          if (!line.startsWith('data:')) continue;
-          const payload = line.slice(5).trim();
-          if (!payload) continue;
-          try {
-            onEvent(JSON.parse(payload) as DshStreamEvent);
-          } catch (err) {
-            logger.warn('Failed to parse SSE event', {
-              payload,
-              error: err instanceof Error ? err.message : String(err),
-            });
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        if (buffer.length > 2 * 1024 * 1024) throw new Error('SSE frame exceeds limit');
+        let sep: number;
+        while ((sep = buffer.indexOf('\n\n')) >= 0) {
+          const rawEvent = buffer.slice(0, sep);
+          buffer = buffer.slice(sep + 2);
+          for (const line of rawEvent.split('\n')) {
+            if (!line.startsWith('data:')) continue;
+            const payload = line.slice(5).trim();
+            if (!payload) continue;
+            const event = JSON.parse(payload) as DshStreamEvent;
+            onEvent(event);
+            if (event.type === 'done' || event.type === 'error') return;
           }
         }
       }
+      throw new Error('Reply stream disconnected before a terminal event');
+    } finally {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
     }
   }
 }

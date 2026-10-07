@@ -103,10 +103,10 @@ const ANOTHER = 'wxid_another_999'
   const d2 = decideTrust({ fromUserId: STRANGER, ownerUserId: '', file: { mode: 'manual', trusted: {} } })
   check('空 owner + manual 陌生人拒绝', !d2.allowed)
 
-  // 空 owner + 信任集里有该 user：放行
+  // 空 owner 必须 fail closed，即使历史信任集里有该 user。
   const file = { mode: 'manual', trusted: { [STRANGER]: { addedAt: '2026-01-01T00:00:00Z', by: 'owner' } } }
   const d3 = decideTrust({ fromUserId: STRANGER, ownerUserId: '', file })
-  check('空 owner 但 user 在信任集 → 放行', d3.allowed)
+  check('空 owner 即使 user 在信任集仍拒绝', !d3.allowed)
 }
 
 // 5) setTrustMode / listTrusted 顺序

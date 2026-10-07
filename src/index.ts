@@ -1,5 +1,5 @@
 /**
- * @lanbaolu/dsh-wechat-bridge — DSH 微信桥接插件（hybrid）。
+ * dsh-wechat-portable — DSH 微信桥接插件（hybrid）。
  *
  * Host 侧：
  *  - 启动一个仅监听 127.0.0.1 的内部 HTTP + SSE 服务，供桥接守护进程调用；
@@ -13,7 +13,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { randomBytes } from 'node:crypto'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, appendFileSync, statSync, unlinkSync, chmodSync } from 'node:fs'
-import { join, dirname, resolve } from 'node:path'
+import { join, dirname, resolve, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 
@@ -25,6 +25,10 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { AgentHandle } from '@deepseek-ai/dsh-agent'
 import { createApprovalManager } from './approval.js'
 import { createWechatAgentSetup } from './agent-setup.js'
+import { registerNativeControl } from './host/control.js'
+import { ControlError, parseControlValue, type ControlSetupStatus } from './host/contract.js'
+import { resolveDataDir, defaultWorkingDirectory, ensurePrivateDir, atomicJson, requireWorkspace } from './portable/paths.js'
+import { HttpBoundaryError, requireLoopbackHost, isLoopbackAddress, assertPanelRequest, readJsonBody, ownerSessionKey, isOwnerSessionKey, PromptReplay, assistantTextDelta, deferHostTask } from './host-compat.js'
 
 // Pull in Context augmentation for agents/session/default-model/workspace events.
 import type {} from '@deepseek-ai/dsh-agent'
@@ -38,7 +42,7 @@ import { loadTrust, saveTrust, addTrusted, removeTrusted, setTrustMode, listTrus
 import { parseSessionKey } from './bridge/session-key.js'
 import { parseCalmConfig } from './bridge/config.js'
 
-export const name = '@lanbaolu/dsh-wechat-bridge'
+export const name = 'dsh-wechat-portable'
 
 /** Host services the plugin needs. `webServer` is optional (headless profiles). */
 export const inject = ['tools', 'agents', 'agentDefaultModel', 'agentPresets']
@@ -68,7 +72,7 @@ export const Config = z.object({
   dataDir: z.string().default(''),
   host: z.string().default('127.0.0.1'),
   port: z.number().min(0).max(65535).default(0),
-  autoStart: z.boolean().default(true),
+  autoStart: z.boolean().default(false),
   provider: z.string().default(''),
   model: z.string().default(''),
   workingDirectory: z.string().default(''),
@@ -89,6 +93,7 @@ interface StreamEvent {
   sessionId?: string
   message?: string
   turn?: number
+  terminal?: string
   /** 本轮最后一步的 LLM 用量（turn/end 时随 done 下发，供微信端尾注展示）。 */
   usage?: StreamUsage
 }
@@ -111,27 +116,23 @@ interface ProjectSessionItem {
 
 const PLUGIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 
-function defaultDataDir(): string {
-  return process.env.DSH_HOME || join(homedir(), '.dsh')
-}
-
 export function apply(ctx: Context, config: Config): void {
-  const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
-  const dataDir = config.dataDir || join(dshHome, 'wechat-bridge')
+  requireLoopbackHost(config.host)
+  const dataDir = resolveDataDir(config.dataDir)
   const daemonLogPath = join(dataDir, 'logs', 'daemon.log')
   const pidPath = join(dataDir, 'daemon.pid')
 
-  mkdirSync(dataDir, { recursive: true })
-  mkdirSync(join(dataDir, 'logs'), { recursive: true })
+  ensurePrivateDir(dataDir)
+  ensurePrivateDir(join(dataDir, 'logs'))
 
   const token = randomBytes(24).toString('hex')
   const pluginLogPath = join(dataDir, 'plugin.log')
 
   function debugLog(message: string, data?: unknown): void {
     try {
-      mkdirSync(dataDir, { recursive: true })
+      ensurePrivateDir(dataDir)
       const line = `[${new Date().toISOString()}] ${message}${data === undefined ? '' : ' ' + JSON.stringify(data)}\n`
-      appendFileSync(pluginLogPath, line, 'utf8')
+      appendFileSync(pluginLogPath, line, { encoding: 'utf8', mode: 0o600 })
     } catch {
       // ignore
     }
@@ -142,14 +143,24 @@ export function apply(ctx: Context, config: Config): void {
   const sessionIds = new Map<string, string>()
   const activeSessionIds = new Set<string>()
   const creating = new Map<string, Promise<AgentHandle>>()
+  const creationControllers = new Map<string, AbortController>()
+  const closing = new Set<string>()
+  const pendingPrompts = new Set<string>()
+  const streamReplay = new Map<string, PromptReplay<StreamEvent & { [key: string]: unknown }>>()
+  let hostDisposed = false
   const streamClients = new Map<string, Set<ServerResponse>>()
   /** Accounts waiting to switch to a selected project after the current turn ends. */
   const pendingProjectSwitches = new Set<string>()
   let bridgeChild: ChildProcess | undefined
+  let daemonStarting: Promise<{ ok: boolean; message: string }> | undefined
   let bridgeStartedAt: number | undefined
   let internalServer: ReturnType<typeof createServer> | undefined
   let internalPort = 0
   let pendingSetup: { qrcodeId: string; workingDirectory: string } | undefined
+  // Native Stop is an explicit user decision: the watchdog must not undo it.
+  let nativeStopRequested = false
+  let nativeDaemonChange = false
+  let nativeSetup: { qrcodeId: string; expiresAt: number } | undefined
 
   // -------------------------------------------------------------------------
   // DSH session id persistence (cross-restart continuation)
@@ -167,8 +178,8 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   function saveSessionIdMap(map: Record<string, string>): void {
-    mkdirSync(dataDir, { recursive: true })
-    writeFileSync(sessionIdMapPath, JSON.stringify(map, null, 2) + '\n', 'utf8')
+    ensurePrivateDir(dataDir)
+    atomicJson(sessionIdMapPath, map)
   }
 
   function persistSessionId(accountId: string, dshSessionId: string): void {
@@ -225,8 +236,8 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   function saveSelectedSessionIds(map: Record<string, string>): void {
-    mkdirSync(dataDir, { recursive: true })
-    writeFileSync(selectedSessionIdPath, JSON.stringify(map, null, 2) + '\n', 'utf8')
+    ensurePrivateDir(dataDir)
+    atomicJson(selectedSessionIdPath, map)
   }
 
   function persistSelectedSessionId(accountId: string, dshSessionId: string): void {
@@ -310,160 +321,116 @@ export function apply(ctx: Context, config: Config): void {
   // Agent management
   // -------------------------------------------------------------------------
 
+  function assertOwnerKey(key: string): void {
+    const account = latestAccountId()
+    if (!account || !isOwnerSessionKey(key, account, ownerUserIdOf(account))) {
+      throw new HttpBoundaryError('Only the currently paired account owner may control the bridge', 403)
+    }
+  }
+
+  function ownerControlKey(target?: string): string {
+    const account = latestAccountId()
+    if (!account) throw new Error('No paired account')
+    const key = !target || target === account ? ownerSessionKey(account, ownerUserIdOf(account)) : target
+    assertOwnerKey(key)
+    return key
+  }
+
   async function ensureAgent(accountId: string, input?: { cwd?: string; model?: string }): Promise<AgentHandle> {
-    // If the model just selected a project from inside a WeChat turn, finish
-    // tearing down the old bridge agent before accepting the next message.
+    assertOwnerKey(accountId)
+    if (hostDisposed || closing.has(accountId)) throw new Error('Bridge session is closing')
     if (pendingProjectSwitches.has(accountId)) {
       pendingProjectSwitches.delete(accountId)
-      if (agents.has(accountId)) {
-        await disposeAgent(accountId, { preserveSelection: true })
-      }
+      await disposeAgent(accountId, { preserveSelection: true })
     }
-
     const existing = agents.get(accountId)
     if (existing) return existing
-
     const pending = creating.get(accountId)
     if (pending) return pending
-
-    // Programmatic agents do not inherit agentDefaultModel automatically, so we
-    // resolve the deployment's default model selection explicitly.
+    const controller = new AbortController()
+    creationControllers.set(accountId, controller)
     const task = (async () => {
-      const selection = ctx.agentDefaultModel?.currentSelection()
+      const selection = ctx.agentDefaultModel.currentSelection()
       const provider = config.provider || selection?.provider
       const model = input?.model || config.model || selection?.model
-      const agentOptions = {
-        ...(provider ? { provider } : {}),
-        ...(model ? { model } : {}),
-      }
-
-      // Resume the persisted DSH session when possible; create a fresh one only
-      // when there is no mapping, the old log is gone/corrupt, or the requested
-      // workspace differs from the persisted session's cwd (unless the user
-      // explicitly bound the bridge to a project conversation).
-      //
-      // 项目绑定两级粒度：
-      //  - session key 级（微信内 /session 绑定）：只对当前用户生效；
-      //  - 账号级（Web 面板选择）：对该 bot 下所有用户生效（前缀回退查找）。
+      if (!provider || !model) throw new Error('Select a DSH provider and model before using WeChat')
+      const agentOptions = { provider, model }
       const selectedSessionId = selectedSessionIds.get(accountId)
-        ?? (accountId.includes('::') ? selectedSessionIds.get(botPrefixOf(accountId)) : undefined)
-      const selectedIsAccountLevel = !!selectedSessionId && !selectedSessionIds.has(accountId)
-      let dshSessionId = sessionIds.get(accountId)
-      let handle: AgentHandle | undefined
-      let resumed = false
-      let isSelected = false
-      let selectedCwd: string | undefined
-
-      if (!dshSessionId) dshSessionId = selectedSessionId
-      if (!dshSessionId) {
-        const sessionMap = loadSessionIdMap()
-        dshSessionId = sessionMap[accountId] || undefined
-      }
-      isSelected = !!selectedSessionId && dshSessionId === selectedSessionId
-
+        ?? selectedSessionIds.get(botPrefixOf(accountId))
+      const mapped = selectedSessionId ?? sessionIds.get(accountId) ?? loadSessionIdMap()[accountId]
+      const resumed = !!mapped
+      const preset = resumed ? undefined : await ctx.agentPresets.resolve()
+      if (preset?.broken) throw new Error(`Agent preset is unavailable: ${preset.broken}`)
+      controller.signal.throwIfAborted()
       const setup = createWechatAgentSetup({
-        accountId,
-        approval: approvalManager,
-        log: debugLog,
+        accountId, resumed, presetId: preset?.id, approval: approvalManager, log: debugLog,
+        onStream: (frame) => {
+          // Only committed assistant/message text is published to WeChat. A
+          // failed/retried live attempt cannot be retracted once sent to a phone.
+          if (frame.type === 'chunk' && frame.chunk.type === 'usage') lastUsage.set(accountId, frame.chunk.usage)
+        },
       })
-
-      if (dshSessionId) {
-        try {
-          const candidate = await ctx.agents.resume({
-            resumeSessionId: SessionId(dshSessionId),
-            agentOptions,
-            setup,
-          })
-          const persistedCwd = candidate.agent.session.header.cwd
-          selectedCwd = persistedCwd || undefined
-          const cwdMismatch = input?.cwd && persistedCwd && resolve(input.cwd) !== resolve(persistedCwd)
-          if (cwdMismatch && !isSelected) {
-            debugLog('resume cwd mismatch, create new', {
-              accountId,
-              dshSessionId,
-              requested: resolve(input.cwd!),
-              persisted: resolve(persistedCwd),
-            })
-            await candidate.dispose()
-            handle = undefined
-          } else {
-            handle = candidate
-            resumed = true
-          }
-        } catch (err) {
-          debugLog('resume failed, create new', {
-            accountId,
-            dshSessionId,
-            error: err instanceof Error ? err.message : String(err),
-          })
-          handle = undefined
+      const id = mapped ?? newDshSessionId(accountId)
+      const cwd = requireWorkspace(resolve(input?.cwd || config.workingDirectory || readBridgeConfig().workingDirectory || defaultWorkingDirectory()))
+      let handle: AgentHandle | undefined
+      try {
+        // Failed resume must preserve its mapping and policies, not silently create a fresh Agent.
+        handle = mapped
+          ? await ctx.agents.resume({ resumeSessionId: SessionId(mapped), agentOptions, setup, signal: controller.signal })
+          : await ctx.agents.create({ sessionId: SessionId(id), meta: { cwd, agentPreset: preset!.id }, agentOptions, setup, signal: controller.signal })
+        controller.signal.throwIfAborted()
+        if (hostDisposed || closing.has(accountId)) throw new Error('Bridge session was cancelled during creation')
+        if (mapped && !selectedSessionId && input?.cwd && handle.agent.session.header.cwd && resolve(input.cwd) !== resolve(handle.agent.session.header.cwd)) {
+          throw new Error('Stored session belongs to another workspace; use /new explicitly before changing it')
         }
-      }
-
-      if (!handle) {
-        if (isSelected) {
-          debugLog('selected project session resume failed, clearing binding', {
-            accountId,
-            dshSessionId,
-          })
-          selectedSessionIds.delete(accountId)
-          removeSelectedSessionId(accountId)
-          isSelected = false
+        assertOwnerKey(accountId)
+        persistSessionId(accountId, id)
+        sessionIds.set(accountId, id)
+        agents.set(accountId, handle)
+        activeSessionIds.add(id)
+        await attachSessionToWorkspace(id, handle.agent.session.header.cwd || cwd)
+        controller.signal.throwIfAborted()
+        if (hostDisposed || closing.has(accountId)) throw new Error('Bridge session cancelled while attaching workspace')
+        debugLog('agent ready', { accountId, dshSessionId: id, resumed })
+        return handle
+      } catch (error) {
+        if (handle) {
+          if (agents.get(accountId) === handle) agents.delete(accountId)
+          activeSessionIds.delete(id)
+          await handle.dispose()
         }
-        dshSessionId = newDshSessionId(accountId)
-        debugLog('ensureAgent create', { accountId, dshSessionId, provider, model, selection, resumed: false, selected: false })
-        handle = await ctx.agents.create({
-          sessionId: SessionId(dshSessionId),
-          meta: input?.cwd ? { cwd: resolve(input.cwd) } : undefined,
-          agentOptions,
-          setup,
-        })
-      } else {
-        debugLog('ensureAgent resume', { accountId, dshSessionId, provider, model, selection, resumed: true, selected: isSelected })
+        throw error
       }
-
-      const finalSessionId = dshSessionId!
-      sessionIds.set(accountId, finalSessionId)
-      persistSessionId(accountId, finalSessionId)
-      if (isSelected && !selectedIsAccountLevel) {
-        persistSelectedSessionId(accountId, finalSessionId)
-      } else if (!selectedIsAccountLevel && selectedSessionIds.has(accountId)) {
-        selectedSessionIds.delete(accountId)
-        removeSelectedSessionId(accountId)
-      }
-      agents.set(accountId, handle)
-      activeSessionIds.add(finalSessionId)
-      debugLog('agent ready', { accountId, dshSessionId: finalSessionId, provider, model, selection, resumed, selected: isSelected })
-      if (isSelected && selectedCwd) {
-        await attachSessionToWorkspace(finalSessionId, selectedCwd)
-      } else if (input?.cwd) {
-        await attachSessionToWorkspace(finalSessionId, resolve(input.cwd))
-      }
-      return handle
     })()
-
     creating.set(accountId, task)
-    try {
-      return await task
-    } finally {
-      creating.delete(accountId)
+    try { return await task }
+    finally {
+      if (creating.get(accountId) === task) creating.delete(accountId)
+      if (creationControllers.get(accountId) === controller) creationControllers.delete(accountId)
     }
   }
 
   async function disposeAgent(accountId: string, options?: { preserveSelection?: boolean }): Promise<void> {
-    const handle = agents.get(accountId)
-    const dshSessionId = sessionIds.get(accountId)
-    if (dshSessionId) activeSessionIds.delete(dshSessionId)
-    sessionIds.delete(accountId)
-    agents.delete(accountId)
-    removePersistedSessionId(accountId)
-    if (!options?.preserveSelection && selectedSessionIds.has(accountId)) {
-      selectedSessionIds.delete(accountId)
-      removeSelectedSessionId(accountId)
-    }
-    if (handle) await handle.dispose()
-    closeStreams(accountId)
-    turnStreamState.delete(accountId)
+    closing.add(accountId)
+    creationControllers.get(accountId)?.abort(new Error('Bridge session cleared'))
+    try {
+      await creating.get(accountId)?.catch(() => undefined)
+      const handle = agents.get(accountId)
+      const id = sessionIds.get(accountId)
+      if (id) activeSessionIds.delete(id)
+      sessionIds.delete(accountId)
+      agents.delete(accountId)
+      removePersistedSessionId(accountId)
+      if (!options?.preserveSelection) {
+        selectedSessionIds.delete(accountId)
+        removeSelectedSessionId(accountId)
+      }
+      if (handle) await handle.dispose()
+      closeStreams(accountId)
+      turnStreamState.delete(accountId)
+      pendingPrompts.delete(accountId)
+      streamReplay.delete(accountId)
+    } finally { closing.delete(accountId) }
   }
 
   /** Register the DSH session under a dedicated workspace so it doesn't stay Ungrouped. */
@@ -574,7 +541,7 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   async function selectedProjectPayload(accountId?: string): Promise<Record<string, unknown> | null> {
-    const target = accountId || latestAccountId()
+    const target = ownerControlKey(accountId)
     if (!target) return null
     const selectedId = selectedSessionIds.get(target)
     if (!selectedId) return null
@@ -660,7 +627,7 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   async function selectProjectSession(dshSessionId: string, accountId?: string): Promise<Record<string, unknown>> {
-    const target = accountId || latestAccountId()
+    const target = ownerControlKey(accountId)
     if (!target) return { ok: false, error: '没有已绑定的微信账号，请先扫码绑定。' }
     const items = await listProjectSessions()
     const item = items.find((candidate) => candidate.sessionId === dshSessionId)
@@ -707,7 +674,7 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   async function detachProjectSession(accountId?: string): Promise<Record<string, unknown>> {
-    const target = accountId || latestAccountId()
+    const target = ownerControlKey(accountId)
     if (!target) return { ok: false, error: '没有已绑定的微信账号。' }
     await disposeKeysUnder(target)
     const config = readBridgeConfig()
@@ -718,7 +685,7 @@ export function apply(ctx: Context, config: Config): void {
 
   /** dispose 精确匹配 key 及其 `${key}::` 前缀下的全部 agent（账号级操作用于多用户）。 */
   async function disposeKeysUnder(key: string): Promise<void> {
-    const targets = [...agents.keys()].filter((k) => k === key || k.startsWith(`${key}::`))
+    const targets = [...new Set([...agents.keys(), ...creating.keys()])].filter((k) => k === key || k.startsWith(`${key}::`))
     for (const k of targets) {
       await disposeAgent(k)
     }
@@ -729,9 +696,12 @@ export function apply(ctx: Context, config: Config): void {
   // -------------------------------------------------------------------------
 
   function broadcast(sessionId: string, event: StreamEvent): void {
+    let replay = streamReplay.get(sessionId)
+    if (!replay) { replay = new PromptReplay(); streamReplay.set(sessionId, replay) }
+    const item = replay.push({ ...event, sessionId })
     const clients = streamClients.get(sessionId)
     if (!clients || clients.size === 0) return
-    const payload = `data: ${JSON.stringify({ ...event, sessionId })}\n\n`
+    const payload = `id: ${item.id}\ndata: ${JSON.stringify(item.event)}\n\n`
     for (const res of [...clients]) {
       try {
         res.write(payload)
@@ -769,57 +739,51 @@ export function apply(ctx: Context, config: Config): void {
      */
     const turnStreamState = new Map<string, { hasChunk: boolean; lastText: string }>()
 
-  // Subscribe to every session event and forward assistant chunks to the
-  // bridge daemon. Only sessions created by this plugin are forwarded.
   ctx.on('session/event', (session: { id: unknown }, event: SessionEvent) => {
     const sid = String(session.id)
     if (!activeSessionIds.has(sid)) return
-    const accountId = [...sessionIds.entries()].find(([, v]) => v === sid)?.[0]
+    const accountId = [...sessionIds.entries()].find(([, id]) => id === sid)?.[0]
     if (!accountId) return
-
-    const streamState = turnStreamState.get(accountId) ?? { hasChunk: false, lastText: '' }
-    turnStreamState.set(accountId, streamState)
-
-    if (event.type === 'assistant/chunk') {
-      const chunk = event.data.chunk as { type?: string; text?: string; usage?: StreamUsage } | undefined
-      if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') {
-        streamState.hasChunk = true
-        broadcast(accountId, { type: 'chunk', text: chunk.text })
-      } else if (chunk?.type === 'usage' && chunk.usage) {
-        lastUsage.set(accountId, chunk.usage)
-      }
+    const state = turnStreamState.get(accountId) ?? { hasChunk: false, lastText: '' }
+    turnStreamState.set(accountId, state)
+    if (event.type === 'turn/start') {
+      state.hasChunk = false
+      state.lastText = ''
+      lastUsage.delete(accountId)
     } else if (event.type === 'assistant/message') {
-      // 兜底素材：每步结束都会 append 这条，正文就是该步的完整输出。
-      const content = (event.data as { message?: { content?: unknown } }).message?.content
-      if (Array.isArray(content)) {
-        const text = content
-          .map((block) => block as { type?: string; text?: string })
-          .filter((block) => block?.type === 'text' && typeof block.text === 'string')
-          .map((block) => block.text as string)
-          .join('')
-        if (text) streamState.lastText = text
-      }
+      const content = event.data.message.content
+      const text = content.filter((block) => block.type === 'text').map((block) => block.text).join('')
+      // Per-attempt fallback only. Live text has already been sent; do not duplicate it.
+      if (!state.hasChunk && text) broadcast(accountId, { type: 'chunk', text })
+      if (event.data.usage) lastUsage.set(accountId, event.data.usage)
+      state.lastText = text
     } else if (event.type === 'turn/end') {
-      const fallbackText = streamState.hasChunk ? '' : streamState.lastText
       turnStreamState.delete(accountId)
-      if (fallbackText) {
-        // 宿主没有推送流式增量：把整轮正文作为单个 chunk 补发，避免守护进程
-        // 判定为空回复。（批量推送由守护进程侧按阈值/定时器负责，不会刷屏。）
-        debugLog('session turn/end fallback', { accountId, chars: fallbackText.length })
-        broadcast(accountId, { type: 'chunk', text: fallbackText })
+      pendingPrompts.delete(accountId)
+      const terminal = event.data.reason.kind
+      const messages: Record<string, string> = {
+        completed: '', aborted: '任务已取消。', error: '任务失败，请在电脑端查看具体错误。',
+        blocked: '任务未完成：工具或权限受到限制。', 'max-tokens': '本轮达到输出限制，可继续提问。',
       }
-      debugLog('session turn/end', { accountId, sessionId: sid, reason: event.data.reason })
-      broadcast(accountId, { type: 'done', turn: event.data.turn, message: 'turn ended', usage: lastUsage.get(accountId) })
+      broadcast(accountId, { type: 'done', turn: event.data.turn, terminal, message: messages[terminal] ?? '本轮已结束。', usage: lastUsage.get(accountId) })
       if (pendingProjectSwitches.has(accountId)) {
         pendingProjectSwitches.delete(accountId)
-        void disposeAgent(accountId, { preserveSelection: true }).catch((err) => {
-          debugLog('pending project switch dispose failed', {
-            accountId,
-            error: err instanceof Error ? err.message : String(err),
-          })
+        closing.add(accountId)
+        // session/event is inside append: teardown/cancel may append, so defer it.
+        deferHostTask(() => disposeAgent(accountId, { preserveSelection: true }), (err) => {
+          closing.delete(accountId)
+          debugLog('pending project switch dispose failed', { accountId, error: String(err) })
         })
       }
     }
+  })
+
+  ctx.on('agent/error', ({ agent }) => {
+    const sid = String(agent.session.id)
+    const key = [...sessionIds].find(([, id]) => id === sid)?.[0]
+    if (!key || !activeSessionIds.has(sid)) return
+    pendingPrompts.delete(key)
+    broadcast(key, { type: 'error', message: 'DSH 任务执行失败，请检查电脑端诊断。' })
   })
 
   // -------------------------------------------------------------------------
@@ -828,7 +792,7 @@ export function apply(ctx: Context, config: Config): void {
 
   function isAuthorized(req: IncomingMessage): boolean {
     const header = req.headers.authorization || ''
-    return header === `Bearer ${token}`
+    return isLoopbackAddress(req.socket.remoteAddress) && !req.headers.origin && header === `Bearer ${token}`
   }
 
   function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -836,13 +800,13 @@ export function apply(ctx: Context, config: Config): void {
     res.end(JSON.stringify(body))
   }
 
-  async function readBody(req: IncomingMessage): Promise<any> {
-    const chunks: Buffer[] = []
-    for await (const chunk of req) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
-    }
-    if (chunks.length === 0) return {}
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+  const parsedBodies = new WeakMap<IncomingMessage, Record<string, unknown>>()
+  async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+    const cached = parsedBodies.get(req)
+    if (cached) return cached
+    const body = await readJsonBody(req)
+    parsedBodies.set(req, body)
+    return body
   }
 
   async function handleInternal(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -880,24 +844,35 @@ export function apply(ctx: Context, config: Config): void {
 
       if (req.method === 'POST' && url.pathname === '/api/prompt') {
         const body = await readBody(req)
-        const sessionId: string = String(body.sessionId || 'default')
-        const handle = await ensureAgent(sessionId, { cwd: body.cwd, model: body.model })
-        const text = String(body.text || '').trim()
-        if (!text) {
-          sendJson(res, 400, { ok: false, error: 'text is required' })
-          return
+        const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
+        assertOwnerKey(sessionId)
+        const text = typeof body.text === 'string' ? body.text.trim() : ''
+        if (!text) throw new HttpBoundaryError('text is required', 400)
+        if (pendingPrompts.has(sessionId)) throw new HttpBoundaryError('session is busy', 409)
+        pendingPrompts.add(sessionId)
+        const replay = streamReplay.get(sessionId) ?? new PromptReplay()
+        replay.reset()
+        streamReplay.set(sessionId, replay)
+        try {
+          const handle = await ensureAgent(sessionId, {
+            cwd: typeof body.cwd === 'string' ? body.cwd : undefined,
+            model: typeof body.model === 'string' ? body.model : undefined,
+          })
+          handle.agent.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text }] }))
+          sendJson(res, 200, { accepted: true, sessionId })
+        } catch (error) {
+          pendingPrompts.delete(sessionId)
+          broadcast(sessionId, { type: 'error', message: String(error) })
+          throw error
         }
-        handle.agent.followup(createUserMessage({
-          source: { kind: 'user' },
-          content: [{ type: 'text', text }],
-        }))
-        sendJson(res, 200, { accepted: true, sessionId })
         return
       }
 
       if (req.method === 'POST' && url.pathname === '/api/stop') {
         const body = await readBody(req)
-        const sessionId = String(body.sessionId || 'default')
+        const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
+        assertOwnerKey(sessionId)
+        creationControllers.get(sessionId)?.abort(new Error('WeChat stop requested'))
         const handle = agents.get(sessionId)
         if (handle) {
           handle.agent.cancel({ kind: 'user' })
@@ -911,6 +886,7 @@ export function apply(ctx: Context, config: Config): void {
       if (req.method === 'POST' && url.pathname === '/api/approval/decide') {
         const body = await readBody(req)
         const sessionId = String(body.sessionId || '')
+        assertOwnerKey(sessionId)
         const approved = body.approved === true
         if (!approvalManager) {
           sendJson(res, 200, { ok: false, reason: 'disabled' })
@@ -918,7 +894,7 @@ export function apply(ctx: Context, config: Config): void {
         }
         // 未知/非法 accountId 在 decide 里自然落到 no-pending，无需额外校验。
         const result = sessionId
-          ? approvalManager.decide(sessionId, approved)
+          ? approvalManager.decide(sessionId, approved, typeof body.approvalId === 'string' ? body.approvalId : undefined)
           : { ok: false as const, reason: 'no-pending' as const }
         sendJson(res, 200, result)
         return
@@ -926,14 +902,16 @@ export function apply(ctx: Context, config: Config): void {
 
       if (req.method === 'POST' && url.pathname === '/api/clear') {
         const body = await readBody(req)
-        const sessionId = String(body.sessionId || 'default')
+        const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
+        assertOwnerKey(sessionId)
         await disposeAgent(sessionId)
         sendJson(res, 200, { ok: true })
         return
       }
 
       if (req.method === 'GET' && url.pathname === '/api/stream') {
-        const sessionId = url.searchParams.get('sessionId') || 'default'
+        const sessionId = url.searchParams.get('sessionId') || ''
+        assertOwnerKey(sessionId)
         if (!agents.has(sessionId)) {
           sendJson(res, 404, { ok: false, error: 'session not active' })
           return
@@ -951,6 +929,20 @@ export function apply(ctx: Context, config: Config): void {
           streamClients.set(sessionId, set)
         }
         set.add(res)
+        const lastId = typeof req.headers['last-event-id'] === 'string' ? Number(req.headers['last-event-id']) : 0
+        const replay = streamReplay.get(sessionId)?.snapshot(Number.isSafeInteger(lastId) && lastId >= 0 ? lastId : 0)
+        if (replay?.overflowed) {
+          res.write(`data: ${JSON.stringify({ type: 'error', message: 'Reply exceeded replay buffer; request it again in smaller parts', sessionId })}\n\n`)
+          res.end()
+          set.delete(res)
+          return
+        }
+        for (const item of replay?.entries ?? []) {
+          res.write(`id: ${item.id}\ndata: ${JSON.stringify(item.event)}\n\n`)
+          if (item.event.type === 'done' || item.event.type === 'error') {
+            res.end(); set.delete(res); return
+          }
+        }
         req.on('close', () => {
           set?.delete(res)
           if (set?.size === 0) streamClients.delete(sessionId)
@@ -961,7 +953,7 @@ export function apply(ctx: Context, config: Config): void {
       sendJson(res, 404, { ok: false, error: 'not found' })
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
-      sendJson(res, 400, { ok: false, error: message })
+      sendJson(res, err instanceof HttpBoundaryError ? err.status : 400, { ok: false, error: message })
     }
   }
 
@@ -1000,28 +992,39 @@ export function apply(ctx: Context, config: Config): void {
         // fall through
       }
     }
-    const pid = readPid()
-    return pid !== null && isPidAlive(pid)
+    return false
   }
 
   function daemonPid(): number | undefined {
-    if (bridgeChild && bridgeChild.pid !== undefined && bridgeChild.exitCode === null) {
-      return bridgeChild.pid
-    }
-    return readPid() ?? undefined
+    return bridgeChild && bridgeChild.exitCode === null && bridgeChild.signalCode === null ? bridgeChild.pid : undefined
   }
 
-  async function startDaemon(): Promise<{ ok: boolean; message: string }> {
+  function startDaemon(): Promise<{ ok: boolean; message: string }> {
+    if (daemonStarting) return daemonStarting
+    const task = startDaemonImpl()
+    daemonStarting = task
+    void task.finally(() => { if (daemonStarting === task) daemonStarting = undefined }).catch(() => {})
+    return task
+  }
+
+  async function startDaemonImpl(): Promise<{ ok: boolean; message: string }> {
     if (daemonRunning()) {
       return { ok: true, message: `已运行 (PID: ${daemonPid()})` }
     }
+    if (hostDisposed || !internalPort || !latestAccountId()) return { ok: false, message: '请等待 Host 就绪并先扫码绑定。' }
+    const recorded = readPid()
+    if (recorded !== null && isPidAlive(recorded)) {
+      return { ok: false, message: '发现无法确认归属的运行进程记录。请先关闭原桥接/原宿主或重启设备；不会根据磁盘 PID 杀进程或启动第二份轮询。' }
+    }
+    nativeStopRequested = false
 
     const script = bridgeScript()
     if (!existsSync(script)) {
       return { ok: false, message: `桥接脚本不存在: ${script}（请先 build 插件）` }
     }
 
-    const logFd = await import('node:fs').then(fs => fs.openSync(daemonLogPath, 'a'))
+    const filesystem = await import('node:fs')
+    const logFd = filesystem.openSync(daemonLogPath, 'a', 0o600)
     const child = spawn(process.execPath, [script, 'start'], {
       cwd: dirname(script),
       env: {
@@ -1031,7 +1034,8 @@ export function apply(ctx: Context, config: Config): void {
         // 否则每次拉起都会启动一个 Electron 实例（窗口闪现后秒退，watchdog 无限循环）。
         // 纯 node 宿主（npx dsh web）下该变量无害。
         ELECTRON_RUN_AS_NODE: '1',
-        DSH_HOME: dshHome,
+        NODE_TLS_REJECT_UNAUTHORIZED: '1',
+        DSH_WECHAT_PORTABLE_DATA_DIR: dataDir,
         DSH_BRIDGE_DATA_DIR: dataDir,
         DSH_BRIDGE_API_BASE: `http://127.0.0.1:${internalPort}`,
         DSH_BRIDGE_API_TOKEN: token,
@@ -1040,8 +1044,11 @@ export function apply(ctx: Context, config: Config): void {
       windowsHide: true,
     })
 
+    filesystem.closeSync(logFd)
+    let spawnFailed = false
+    child.once('error', () => { spawnFailed = true; if (bridgeChild === child) bridgeChild = undefined })
     bridgeChild = child
-    writeFileSync(pidPath, String(child.pid || ''), 'utf8')
+    if (child.pid) atomicJson(pidPath, child.pid)
 
     child.on('exit', (code) => {
       try {
@@ -1056,8 +1063,8 @@ export function apply(ctx: Context, config: Config): void {
 
     // Give the daemon a moment to fail early (missing account etc.).
     await new Promise(r => setTimeout(r, 300))
-    if (child.exitCode !== null) {
-      return { ok: false, message: `守护进程启动失败 (exit ${child.exitCode})，请查看日志` }
+    if (spawnFailed || !child.pid || child.exitCode !== null || child.signalCode !== null) {
+      return { ok: false, message: '守护进程启动失败，请检查本地私密诊断日志。' }
     }
 
     bridgeStartedAt = Date.now()
@@ -1065,29 +1072,32 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   async function stopDaemon(): Promise<{ ok: boolean; message: string }> {
-    const pid = daemonPid()
-    if (bridgeChild && bridgeChild.pid !== undefined && bridgeChild.exitCode === null) {
-      // 局部引用：await 期间 daemon 退出会触发 child.on('exit') 把 bridgeChild 清成
-      // undefined，后续访问 bridgeChild.exitCode 会抛 TypeError（扫码重绑时曾出现）。
-      const child = bridgeChild
-      child.kill()
-      await new Promise(r => setTimeout(r, 500))
-      if (child.exitCode === null) {
-        child.kill('SIGKILL')
-      }
-    } else if (pid) {
-      try {
-        process.kill(pid)
-      } catch {
-        // already gone
-      }
+    nativeStopRequested = true
+    await daemonStarting?.catch(() => undefined)
+    for (const controller of creationControllers.values()) controller.abort(new Error('Bridge stopped'))
+    for (const handle of agents.values()) handle.agent.cancel({ kind: 'user' })
+    const child = bridgeChild
+    if (!child) {
+      const recorded = readPid()
+      if (recorded !== null && isPidAlive(recorded)) return { ok: false, message: '进程归属不明，未发送任何终止信号。请关闭原宿主或重启设备。' }
+      return { ok: true, message: '本实例未运行桥接。' }
     }
-    try {
-      unlinkSync(pidPath)
-    } catch {
-      // ignore
+    // Only signal the child handle this plugin actually spawned, never a disk PID.
+    child.kill()
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 1000)
+      child.once('exit', () => { clearTimeout(timer); resolve() })
+    })
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGKILL')
+      await new Promise(r => setTimeout(r, 200))
     }
-    bridgeChild = undefined
+    if (child.exitCode === null && child.signalCode === null) return { ok: false, message: '桥接进程尚未退出；请稍后再试。' }
+    // These are this child's private, fixed metadata paths, not migrated PIDs.
+    for (const file of [pidPath, join(dataDir, 'daemon-port.json')]) {
+      try { unlinkSync(file) } catch { /* already removed */ }
+    }
+    if (bridgeChild === child) bridgeChild = undefined
     return { ok: true, message: '已停止' }
   }
 
@@ -1113,7 +1123,7 @@ export function apply(ctx: Context, config: Config): void {
         calm?: import('./bridge/config.js').CalmConfig
       }
       return {
-        workingDirectory: raw.workingDirectory || join(homedir(), 'Documents', 'DSH'),
+        workingDirectory: raw.workingDirectory || defaultWorkingDirectory(),
         model: raw.model,
         systemPrompt: raw.systemPrompt,
         notifyRejected: raw.notifyRejected === true || raw.notifyRejected === 'true',
@@ -1123,13 +1133,13 @@ export function apply(ctx: Context, config: Config): void {
       }
     } catch {
       return {
-        workingDirectory: join(homedir(), 'Documents', 'DSH'),
+        workingDirectory: defaultWorkingDirectory(),
       }
     }
   }
 
   function saveBridgeConfig(config: { workingDirectory: string; model?: string; systemPrompt?: string; notifyRejected?: boolean; usageFooter?: boolean; preventSleep?: boolean; calm?: import('./bridge/config.js').CalmConfig }): void {
-    mkdirSync(dataDir, { recursive: true })
+    ensurePrivateDir(dataDir)
     // 合并写回：不覆盖 daemon 侧写入的其他字段（如 usageFooter）。
     let existing: Record<string, unknown> = {}
     try {
@@ -1147,19 +1157,19 @@ export function apply(ctx: Context, config: Config): void {
     if (config.notifyRejected !== undefined) data.notifyRejected = config.notifyRejected
     if (config.calm !== undefined) data.calm = config.calm
     if (config.preventSleep !== undefined) data.preventSleep = config.preventSleep
-    writeFileSync(bridgeConfigPath(), JSON.stringify(data, null, 2) + '\n', 'utf8')
+    atomicJson(bridgeConfigPath(), data)
     if (process.platform !== 'win32') {
       chmodSync(bridgeConfigPath(), 0o600)
     }
   }
 
   async function startSetup(workingDirectory?: string): Promise<Record<string, unknown>> {
-    const dir = (workingDirectory?.trim() || readBridgeConfig().workingDirectory || join(homedir(), 'Documents', 'DSH')).replace(/^~/, homedir())
+    const dir = (workingDirectory?.trim() || readBridgeConfig().workingDirectory || defaultWorkingDirectory()).replace(/^~/, homedir())
     const { qrcodeUrl, qrcodeId } = await startQrLogin()
     const QRCode = await import('qrcode')
     const qrcodeDataUrl = await QRCode.toDataURL(qrcodeUrl, {
       width: 320,
-      margin: 2,
+      margin: 4,
     })
     pendingSetup = { qrcodeId, workingDirectory: dir }
     return {
@@ -1171,23 +1181,29 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
-  async function checkSetupStatus(qrcodeId: string): Promise<Record<string, unknown>> {
+  async function checkSetupStatus(qrcodeId: string, options?: { autoStart?: boolean }): Promise<Record<string, unknown>> {
     if (!pendingSetup || pendingSetup.qrcodeId !== qrcodeId) {
       return { ok: false, status: 'idle', message: '没有进行中的扫码绑定，请先点击“扫码绑定”。' }
     }
 
-    const result = await checkQrStatus(qrcodeId)
+    const setup = pendingSetup
+    const stillCurrent = () => !hostDisposed && pendingSetup === setup && (options?.autoStart !== false ||
+      (nativeSetup?.qrcodeId === qrcodeId && Date.now() < nativeSetup.expiresAt))
+    const result = await checkQrStatus(qrcodeId, dataDir, stillCurrent)
+    if (!stillCurrent()) return { ok: false, status: 'idle', message: '扫码绑定已结束，未继续保存授权。' }
 
     if (result.status === 'confirmed') {
       const config = readBridgeConfig()
-      config.workingDirectory = pendingSetup.workingDirectory
+      config.workingDirectory = setup.workingDirectory
       saveBridgeConfig(config)
       pendingSetup = undefined
 
       // A newly bound account only takes effect after the daemon reloads the
       // latest account file. Restart when running, otherwise start it so the
       // user does not have to manually restart after every re-scan.
-      const daemonResult = daemonRunning() ? await restartDaemon() : await startDaemon()
+      const daemonResult = options?.autoStart === false
+        ? { ok: true, message: '已绑定，请手动启动桥接。' }
+        : daemonRunning() ? await restartDaemon() : await startDaemon()
       return {
         ok: true,
         status: 'confirmed',
@@ -1249,6 +1265,119 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   // -------------------------------------------------------------------------
+  // Native Desktop control: one local operator, one currently paired owner.
+  // No HTTP trampoline, account selector, trust editor or permission mutation.
+  // -------------------------------------------------------------------------
+
+  function assertNativeReady(): void {
+    if (hostDisposed || internalPort === 0) throw new ControlError('桥接 Host 尚未就绪或正在卸载。', 'unavailable')
+  }
+
+  function nativeWorkingDirectory(input: string): string {
+    const expanded = input.trim().replace(/^~(?=$|[\\/])/, homedir())
+    if (!isAbsolute(expanded)) throw new ControlError('工作目录必须是本机已有目录的绝对路径。')
+    const directory = resolve(expanded)
+    try {
+      if (statSync(directory).isDirectory()) return requireWorkspace(directory)
+    } catch { /* Do not echo OS errors, configuration contents or request data. */ }
+    throw new ControlError('工作目录不存在或不是可访问的目录。')
+  }
+
+  async function nativeDaemonAction(action: 'start' | 'stop' | 'restart'): Promise<{ message: string }> {
+    assertNativeReady()
+    if (nativeSetup && Date.now() >= nativeSetup.expiresAt) forgetNativeSetup(nativeSetup.qrcodeId)
+    if (nativeSetup) throw new ControlError('请先结束扫码绑定，再启动或停止桥接。', 'busy')
+    if (action !== 'stop') {
+      if (!latestAccountId()) throw new ControlError('请先扫码绑定主人账号。')
+      ownerControlKey() // Same owner scope as internal control; never accept a payload target.
+    }
+    if (nativeDaemonChange) throw new ControlError('桥接进程操作正在进行。', 'busy')
+    nativeStopRequested = action === 'stop'
+    nativeDaemonChange = true
+    try {
+      const result = action === 'start' ? await startDaemon() : action === 'stop' ? await stopDaemon() : await restartDaemon()
+      if (!result.ok) throw new ControlError('桥接进程操作未成功，请检查本地构建及诊断。', 'operation-failed')
+      return { message: result.message }
+    } finally { nativeDaemonChange = false }
+  }
+
+  function forgetNativeSetup(qrcodeId: string): void {
+    if (nativeSetup?.qrcodeId !== qrcodeId) return
+    nativeSetup = undefined
+    if (pendingSetup?.qrcodeId === qrcodeId) pendingSetup = undefined
+  }
+
+  registerNativeControl(ctx, {
+    available: () => !hostDisposed,
+    status: () => ({
+      ready: !hostDisposed && internalPort !== 0,
+      running: daemonRunning(),
+      paired: !!latestAccountId(),
+      ownerOnly: true,
+      pid: daemonPid() ?? null,
+      startedAt: bridgeStartedAt ?? null,
+      workingDirectory: readBridgeConfig().workingDirectory,
+      activeSessions: activeSessionIds.size + creating.size,
+    }),
+    start: () => nativeDaemonAction('start'),
+    stop: () => nativeDaemonAction('stop'),
+    restart: () => nativeDaemonAction('restart'),
+    setWorkspace: (input) => {
+      assertNativeReady()
+      const workingDirectory = nativeWorkingDirectory(input)
+      // Only the default changes. Never rebind another session or broaden its policy.
+      saveBridgeConfig({ ...readBridgeConfig(), workingDirectory })
+      return { workingDirectory, message: '默认工作目录已保存；请重启桥接后新建会话。已有会话和权限设置保持不变。' }
+    },
+    startSetup: async (input) => {
+      assertNativeReady()
+      if (daemonRunning() || activeSessionIds.size || creating.size || pendingPrompts.size) {
+        throw new ControlError('请先停止桥接并等待主人会话结束，再扫码绑定。', 'busy')
+      }
+      const directory = nativeWorkingDirectory(input ?? readBridgeConfig().workingDirectory)
+      nativeStopRequested = true
+      if (nativeSetup) forgetNativeSetup(nativeSetup.qrcodeId)
+      const result = await startSetup(directory)
+      if (hostDisposed) { pendingSetup = undefined; throw new ControlError('桥接正在卸载。', 'unavailable') }
+      const setup = parseControlValue('setup.start', {
+        qrcodeId: result.qrcodeId, qrcodeDataUrl: result.qrcodeDataUrl, workingDirectory: result.workingDirectory,
+      })
+      nativeSetup = { qrcodeId: setup.qrcodeId, expiresAt: Date.now() + 5 * 60_000 }
+      return setup
+    },
+    pollSetup: async (qrcodeId) => {
+      assertNativeReady()
+      if (!nativeSetup || nativeSetup.qrcodeId !== qrcodeId || pendingSetup?.qrcodeId !== qrcodeId) {
+        throw new ControlError('没有匹配的本机扫码绑定请求。')
+      }
+      if (Date.now() >= nativeSetup.expiresAt) {
+        forgetNativeSetup(qrcodeId)
+        return { status: 'expired', message: '二维码已超时，请重新获取。', retryable: false }
+      }
+      if (daemonRunning()) throw new ControlError('扫码绑定期间桥接必须保持停止。', 'busy')
+      const result = await checkSetupStatus(qrcodeId, { autoStart: false })
+      const status = result.status as ControlSetupStatus['status']
+      const messages: Record<ControlSetupStatus['status'], string> = {
+        wait: '等待扫码…', scaned: '已扫码，请在微信中确认。', confirmed: '绑定成功，请手动启动桥接。',
+        expired: '二维码已失效，请重新获取。', error: '扫码确认暂不可用，请重试。', idle: '扫码绑定已结束。',
+      }
+      if (!Object.hasOwn(messages, status)) throw new ControlError('微信返回了无法识别的扫码状态。', 'operation-failed')
+      if (status === 'confirmed' || status === 'expired' || status === 'idle' || (status === 'error' && result.retryable !== true)) {
+        forgetNativeSetup(qrcodeId)
+      }
+      // Error/expiry messages originate in the fixed login diagnostic vocabulary,
+      // never in an arbitrary response body or raw network exception.
+      const message = (status === 'error' || status === 'expired') && typeof result.message === 'string'
+        ? result.message : messages[status]
+      return { status, message, retryable: result.retryable === true }
+    },
+    cancelSetup: (qrcodeId) => {
+      forgetNativeSetup(qrcodeId)
+      return { message: '本机扫码绑定已结束。' }
+    },
+  })
+
+  // -------------------------------------------------------------------------
   // 信任集管理（P1-2 / M4：面板 + 内部 API）
   // -------------------------------------------------------------------------
 
@@ -1256,27 +1385,16 @@ export function apply(ctx: Context, config: Config): void {
     const file = loadTrustFile()
     const latest = latestAccountId()
     return {
-      mode: file.mode,
+      mode: 'owner-only',
       bootstrapConsumed: file.bootstrapConsumed === true,
       owner: latest ? ownerUserIdOf(latest) : '',
       notifyRejected: readBridgeConfig().notifyRejected === true,
-      trusted: listTrusted(file),
+      trusted: [],
     }
   }
 
-  function trustAdd(userId: string, note?: string): { ok: boolean; error?: string } {
-    const id = String(userId || '').trim()
-    if (!isPlausibleUserId(id)) {
-      return { ok: false, error: 'userId 格式不合法（应为 4-64 位字母/数字/_ . @ = -）' }
-    }
-    const file = loadTrustFile()
-    const latest = latestAccountId()
-    if (latest && id === ownerUserIdOf(latest)) {
-      return { ok: false, error: 'owner 永远放行，不需要加入信任集' }
-    }
-    saveTrustFile(addTrusted(file, id, 'owner', note?.trim() || undefined))
-    debugLog('trust add via panel', { userId: id })
-    return { ok: true }
+  function trustAdd(_userId: string, _note?: string): { ok: boolean; error?: string } {
+    return { ok: false, error: 'Single-owner release: additional users are disabled' }
   }
 
   function trustRemove(userId: string): { ok: boolean; error?: string } {
@@ -1291,9 +1409,7 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   function trustSetMode(mode: string): { ok: boolean; error?: string } {
-    if (mode !== 'owner-only' && mode !== 'bootstrap' && mode !== 'manual') {
-      return { ok: false, error: '模式必须是 owner-only / bootstrap / manual' }
-    }
+    if (mode !== 'owner-only') return { ok: false, error: 'Single-owner release only supports owner-only' }
     saveTrustFile(setTrustMode(loadTrustFile(), mode as TrustMode))
     debugLog('trust mode set via panel', { mode })
     return { ok: true }
@@ -1330,12 +1446,28 @@ export function apply(ctx: Context, config: Config): void {
     })
   }
 
-  function registerRoutesInto(webServer: { register(route: WebRouteLike): () => void }): (() => void)[] {
+  function registerRoutesInto(rawWebServer: { register(route: WebRouteLike): () => void }): (() => void)[] {
     const disposers: (() => void)[] = []
+    const readPaths = new Set(['status', 'notify/status', 'pending/status', 'logs', 'projects', 'setup/status', 'trust'])
+    const webServer = { register(route: WebRouteLike): () => void {
+      const suffix = route.path.slice('/dsh-wechat-portable/'.length)
+      const methods = suffix === 'config' ? ['GET', 'POST'] : readPaths.has(suffix) ? ['GET'] : ['POST']
+      return rawWebServer.register({ ...route, handler: async (req, res) => {
+        try {
+          assertPanelRequest(req, methods)
+          if (req.method === 'POST') await readBody(req)
+          res.setHeader('Cache-Control', 'no-store')
+          await route.handler(req, res)
+        } catch (error) {
+          if (!res.headersSent) sendJson(res, error instanceof HttpBoundaryError ? error.status : 400, { ok: false, error: error instanceof Error ? error.message : String(error) })
+          else res.end()
+        }
+      } })
+    } }
 
     disposers.push(webServer.register({
       kind: 'exact',
-      path: '/@lanbaolu/dsh-wechat-bridge/status',
+      path: '/dsh-wechat-portable/status',
       handler: async (_req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify(await statusPayload()))
@@ -1344,7 +1476,7 @@ export function apply(ctx: Context, config: Config): void {
 
     disposers.push(webServer.register({
       kind: 'exact',
-      path: '/@lanbaolu/dsh-wechat-bridge/notify/status',
+      path: '/dsh-wechat-portable/notify/status',
       handler: async (_req, res) => {
         const result = await queryNotifyStatus()
         res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -1354,7 +1486,7 @@ export function apply(ctx: Context, config: Config): void {
 
     disposers.push(webServer.register({
       kind: 'exact',
-      path: '/@lanbaolu/dsh-wechat-bridge/pending/status',
+      path: '/dsh-wechat-portable/pending/status',
       handler: async (_req, res) => {
         const result = await queryPendingStatus()
         res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -1365,7 +1497,7 @@ export function apply(ctx: Context, config: Config): void {
     for (const action of ['start', 'stop', 'restart'] as const) {
       disposers.push(webServer.register({
         kind: 'exact',
-        path: `/@lanbaolu/dsh-wechat-bridge/${action}`,
+        path: `/dsh-wechat-portable/${action}`,
         handler: async (_req, res) => {
           const result = action === 'start' ? await startDaemon()
             : action === 'stop' ? await stopDaemon()
@@ -1378,7 +1510,7 @@ export function apply(ctx: Context, config: Config): void {
 
     disposers.push(webServer.register({
       kind: 'exact',
-      path: '/@lanbaolu/dsh-wechat-bridge/logs',
+      path: '/dsh-wechat-portable/logs',
       handler: async (_req, res) => {
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' })
         res.end(readDaemonLogs(200))
@@ -1387,7 +1519,7 @@ export function apply(ctx: Context, config: Config): void {
 
     disposers.push(webServer.register({
       kind: 'exact',
-      path: '/@lanbaolu/dsh-wechat-bridge/projects',
+      path: '/dsh-wechat-portable/projects',
       handler: async (_req, res) => {
         const result = await listProjectSessions()
         res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -1397,7 +1529,7 @@ export function apply(ctx: Context, config: Config): void {
 
     disposers.push(webServer.register({
       kind: 'exact',
-      path: '/@lanbaolu/dsh-wechat-bridge/projects/select',
+      path: '/dsh-wechat-portable/projects/select',
       handler: async (req, res) => {
         try {
           const body = await readBody(req)
@@ -1416,10 +1548,10 @@ export function apply(ctx: Context, config: Config): void {
 
     disposers.push(webServer.register({
       kind: 'exact',
-      path: '/@lanbaolu/dsh-wechat-bridge/projects/detach',
+      path: '/dsh-wechat-portable/projects/detach',
       handler: async (req, res) => {
         try {
-          const body = await readBody(req).catch(() => ({}))
+          const body = await readBody(req)
           const accountId = body && typeof body.accountId === 'string' && body.accountId ? body.accountId : undefined
           const result = await detachProjectSession(accountId)
           res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json' })
@@ -1434,7 +1566,7 @@ export function apply(ctx: Context, config: Config): void {
 
     disposers.push(webServer.register({
       kind: 'exact',
-      path: '/@lanbaolu/dsh-wechat-bridge/setup/start',
+      path: '/dsh-wechat-portable/setup/start',
       handler: async (req, res) => {
         try {
           let workingDirectory: string | undefined
@@ -1457,7 +1589,7 @@ export function apply(ctx: Context, config: Config): void {
 
     disposers.push(webServer.register({
       kind: 'exact',
-      path: '/@lanbaolu/dsh-wechat-bridge/setup/status',
+      path: '/dsh-wechat-portable/setup/status',
       handler: async (req, res) => {
         try {
           const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`)
@@ -1476,7 +1608,7 @@ export function apply(ctx: Context, config: Config): void {
 
     disposers.push(webServer.register({
       kind: 'exact',
-      path: '/@lanbaolu/dsh-wechat-bridge/trust',
+      path: '/dsh-wechat-portable/trust',
       handler: async (_req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ ok: true, ...trustPayload() }))
@@ -1485,7 +1617,7 @@ export function apply(ctx: Context, config: Config): void {
 
     disposers.push(webServer.register({
       kind: 'exact',
-      path: '/@lanbaolu/dsh-wechat-bridge/trust/add',
+      path: '/dsh-wechat-portable/trust/add',
       handler: async (req, res) => {
         try {
           const body = await readBody(req)
@@ -1501,7 +1633,7 @@ export function apply(ctx: Context, config: Config): void {
 
     disposers.push(webServer.register({
       kind: 'exact',
-      path: '/@lanbaolu/dsh-wechat-bridge/trust/remove',
+      path: '/dsh-wechat-portable/trust/remove',
       handler: async (req, res) => {
         try {
           const body = await readBody(req)
@@ -1517,7 +1649,7 @@ export function apply(ctx: Context, config: Config): void {
 
     disposers.push(webServer.register({
       kind: 'exact',
-      path: '/@lanbaolu/dsh-wechat-bridge/trust/config',
+      path: '/dsh-wechat-portable/trust/config',
       handler: async (req, res) => {
         try {
           const body = await readBody(req)
@@ -1541,7 +1673,7 @@ export function apply(ctx: Context, config: Config): void {
     // config.json 由 host 与 daemon 共享，写盘后 daemon 侧最多延迟一个轮询周期生效。
     disposers.push(webServer.register({
       kind: 'exact',
-      path: '/@lanbaolu/dsh-wechat-bridge/config',
+      path: '/dsh-wechat-portable/config',
       handler: async (req, res) => {
         try {
           if (req.method === 'GET' || req.method === undefined) {
@@ -1966,7 +2098,7 @@ export function apply(ctx: Context, config: Config): void {
         host: config.host,
         port: internalPort,
       })
-      if (config.autoStart) {
+      if (config.autoStart && !nativeStopRequested) {
         startDaemon().then(result => {
           ctx.logger?.info?.('[dsh-wechat-bridge] autoStart', result)
         }).catch(err => {
@@ -1984,7 +2116,7 @@ export function apply(ctx: Context, config: Config): void {
     let healthTimer: ReturnType<typeof setInterval> | undefined
     if (config.autoStart) {
       healthTimer = setInterval(() => {
-        if (daemonRunning()) return
+        if (nativeStopRequested || nativeDaemonChange || daemonRunning()) return
         startDaemon().then(result => {
           ctx.logger?.info?.('[dsh-wechat-bridge] watchdog auto-start', result)
         }).catch(err => {
@@ -1994,14 +2126,23 @@ export function apply(ctx: Context, config: Config): void {
       healthTimer.unref?.()
     }
 
-    return () => {
+    return async () => {
+      hostDisposed = true
+      nativeSetup = undefined
+      pendingSetup = undefined
       if (healthTimer) clearInterval(healthTimer)
+      for (const controller of creationControllers.values()) controller.abort(new Error('WeChat bridge unloaded'))
+      await Promise.allSettled([...creating.values()])
+      approvalManager?.dispose()
       for (const handle of agents.values()) {
-        void handle.dispose()
+        await handle.dispose()
       }
       agents.clear()
       activeSessionIds.clear()
+      for (const key of streamClients.keys()) closeStreams(key)
       streamClients.clear()
+      streamReplay.clear()
+      pendingPrompts.clear()
       if (bridgeChild && bridgeChild.exitCode === null) {
         bridgeChild.kill()
       }

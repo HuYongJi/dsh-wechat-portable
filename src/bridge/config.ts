@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { DATA_DIR, DEFAULT_WORKING_DIR } from "./constants.js";
+import { atomicJson } from '../portable/paths.js';
 
 export interface Config {
   workingDirectory: string;
@@ -101,8 +102,5 @@ export function saveConfig(config: Config): void {
   if (config.notifyRejected !== undefined) data.notifyRejected = config.notifyRejected;
   if (config.calm !== undefined) data.calm = config.calm;
   if (config.preventSleep !== undefined) data.preventSleep = config.preventSleep;
-  writeFileSync(CONFIG_PATH, JSON.stringify(data, null, 2) + "\n", "utf-8");
-  if (process.platform !== "win32") {
-    chmodSync(CONFIG_PATH, 0o600);
-  }
+  atomicJson(CONFIG_PATH, data);
 }

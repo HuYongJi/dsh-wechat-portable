@@ -1,239 +1,94 @@
-# @lanbaolu/dsh-wechat-bridge
+# DSH WeChat Portable · 0.1.0-alpha.4
 
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)
-![CI](https://github.com/lanbaolu/dsh-wechat-bridge/actions/workflows/ci.yml/badge.svg)
-![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)
+面向 **DSH Desktop 0.2.0-rc.2** 的独立社区微信桥接预览版。基于 lanbaolu/dsh-wechat-bridge 0.9.1（MIT）改造；不是 DeepSeek、微信或上游作者的官方产品，也不代表获得其背书。
 
-基于 [Wechat-ggGitHub/wechat-claude-code](https://github.com/Wechat-ggGitHub/wechat-claude-code) 开发的 **DeepSeek Harness (DSH) 微信桥接插件**。
+> **预览版，先用测试账号和独立工作目录。** 本地构建、自动化与协议边界测试不能替代桌面安装和真实微信验收。alpha.1 本机安装后发现原生 Remote 的依赖注入遗漏；alpha.2 针对该问题修复并增加真实 Cordis 生命周期回归。alpha.3 改为独立严格 TLS 的扫码请求并兼容当前二维码响应；真实取码与 PNG 生成已通过，用户已确认绑定成功，微信收发通道能返回错误提示。alpha.4 修复 Agent 初始化中两处作用域服务访问错误；正常模型回复、macOS/Linux 与媒体收发仍待验证。若微信要求额外配对码或切换登录节点，本版会明确停止，尚不支持这些分支；不要在聊天中发送验证码。使用相关微信接口可能受服务规则、接口变更和账号风控影响。
 
-> ⚠️ 免责声明：本项目仅用于个人学习与自动化。使用非官方微信协议存在账号风险，请自行评估并承担后果。
+## 这一版的重点
 
-**三端通用**：Windows / macOS / Linux 均使用纯 Node.js 进程管理，不依赖 launchd / systemd / Windows Service；同时提供 DSH 模型工具（CLI/Headless 可用）和 Web 管理面板（Web/桌面可用）。
+- 使用实际 0.2 SDK，不做版本豁免、不降级宿主。
+- 桌面设置面板走原生 Typert Remote/IPC，不依赖 `file://` 页面跨域调用 HTTP。
+- 单个扫码绑定者本人使用；不开放多用户、bootstrap 或远程添加信任。
+- 独立 profile 数据目录；新建会话保留更严格的权限默认值，恢复会话不覆盖已有权限或 preset。
+- 微信文本批量回传、会话恢复、停止、一次性审批码；快速结束事件有有界重放。
+- 分享程序与普通偏好，不分享微信凭据、账号标识、聊天记录、日志、二维码、进程状态或本机路径。
+- 图片/文件/MP4 下载采用随机私有文件名、25 MiB 单文件上限与有界流读取；附件缓存上限 256 MiB。
+- **不自动上传回复中提到的文件。** 只有本人显式 `/send`，且文件必须在当前工作目录内、非隐藏、非私密目录、非链接且类型受支持。
 
-## 功能
+## 安装前
 
-- 微信扫码绑定个人微信后，在微信里直接与 **DSH 本机 Agent** 对话。
-- 复用 wechat-claude-code 的 iLink Bot 微信协议层：文字、图片、语音转文字、文件收发。
-- 守护进程由 DSH 插件管理：启动 / 停止 / 重启 / 状态 / 日志，全部走模型工具或 Web 面板。
-- 每个微信账号对应一个 DSH 会话，DSH Host 重启后会自动 `resume` 原持久化会话，对话上下文不断档；`/clear`、`/new`、`/stop`、`/cwd`、`/model`、`/prompt` 等斜杠命令可用。
-- 回复回传：DSH Agent 的回复经本地 SSE 推送到微信（批量发送，不刷屏）。会话格式 v3+ 起宿主不再下发 `assistant/chunk` 增量，现为整轮结束时回传本轮最后一条 assistant 消息正文——有工具调用的多步轮次只回传最后一步文本，逐段流式待恢复（见 `docs/future-plan.md`）。
-- 超时安抚：DSH 超过 5 分钟无输出时自动发一条“还在处理”的消息。
-- 主动通知：agent 可通过 `wechat_notify` 工具在任务完成 / 失败 / 需要确认时主动推送微信，内置节流（每小时 ≤6 条、每日 ≤50 条，超限排队延迟发送），规避个人号风控。
-- **微信内审批**：agent 请求权限时推送审批消息到微信，回复 `/yes` 批准、`/no` 拒绝；超时自动拒绝（fail-closed），仅绑定账号本人可裁决，不影响桌面 GUI 会话。
-- 防卡死：微信会话自动注入通道约束提示词，禁用浏览器端交互式选项工具（手机看不到会永久阻塞），改用纯文本编号选项。
-- 文件双向：微信发图片/文件给 DSH；DSH 回复中提到的本地文件会自动推回微信。
-- 消息队列：处理中收到的普通消息会排队，等当前任务结束后继续处理（多用户下按用户独立排队，A 的长任务不阻塞 B）。
-- **多用户支持**：信任集 + per-user 会话。可让多个微信用户与同一 bot 对话，每人独立会话/上下文/队列/审批归属，互不可见；信任集可控、可吊销（详见下方「安全模型」）。
+1. 确认 DSH 为 **0.2.0-rc.2**。其他版本不宣称兼容；不要添加版本豁免。
+2. 保留当前 DSH 配置备份，并停止旧微信桥接。不要让两个桥接同时轮询同一账号。
+3. 从本次分发包取得 `dsh-wechat-portable-0.1.0-alpha.4.tgz`，核对附带 SHA-256。
+4. 在 DSH 的插件管理中使用**本地包来源/本地文件路径**安装该 tarball。若当前界面不支持本地来源，请先通过该版本 DSH 的插件安装帮助确认入口，不要手改应用归档或强行替换 SDK。
+5. 启用后按 DSH 提示重新加载/重启桌面。不会自动开始微信绑定；默认 `autoStart: false`。
+6. 设置中打开“微信桥接（Portable）”，选择一个**本机已存在、专用的工作目录**，获取二维码并在微信确认。
+7. 扫码成功后仍保持停止；检查模型选择与工作目录，再手动启动。
 
-### 媒体能力矩阵（2026-08-21 代码核实 + 真机抽验；2026-08-29 视频收发补齐）
+安装会改变目标设备的插件配置，必须由该设备使用者自行确认。本项目不内置下载/安装宿主、提权、写注册表、修改 ACL、后台服务或开机启动脚本。
 
-| 方向 | 文本 | 图片 | 语音 | 文件 | 视频 |
-|---|---|---|---|---|---|
-| 微信 → DSH | ✅ | ✅ CDN 下载+解密落盘 | ✅ iLink 端转写为文本 | ✅ 下载落盘交 agent | ✅ CDN 下载落盘交 agent（存 .mp4） |
-| DSH → 微信 | ✅ 攒批聚合发送 | ✅ 按扩展名路由直发 | — | ✅ 回复提及自动推送 | ✅ 按扩展名路由直发（mp4/mov/webm/mkv/avi） |
+## 微信使用
 
-> 语音出站（DSH → 微信）仍未支持：协议无公开实现参考，需真机实测后补齐。视频收发为 2026-08-29 按 iLink/ClawBot 协议源码补齐，**真机收发已抽验通过（2026-08-30）**。
+| 操作 | 命令/方式 |
+|---|---|
+| 对话 | 直接发文字；使用 DSH 当前配置的模型 |
+| 停止当前任务 | `/stop` |
+| 开新会话 | `/new` 或 `/clear` |
+| 查看帮助 | `/help` |
+| 批准一次权限请求 | 完整回复消息中的 `/yes <审批码>` |
+| 拒绝权限请求 | `/no <审批码>` |
+| 发送成果文件 | `/send ./report.pdf` |
 
-方向对照与后续可行性方案见 [`docs/feasibility-plan.md`](docs/feasibility-plan.md)。
+不带审批码、过期、错误或上一条请求的审批码均不能批准新请求。超时、断开、取消、推送失败时不授予权限。需要信息时 Agent 以普通文字提问，不使用手机不可见的交互表单。
 
-## 架构
+支持显式发送的类型：PNG/JPEG/GIF/WebP、PDF、DOCX/XLSX/PPTX、TXT/MD/CSV、MP4。没有病毒扫描或安全内容识别；普通文档也可能包含敏感信息，发送前自行检查。语音只保留上游接口返回的转写文本，不提供语音合成。视频的实际理解能力取决于宿主工具/模型，不能因下载成功就宣称可理解。
 
-```
-微信 App ←→ iLink Bot API ←→ bridge daemon (Node.js)
-                                  │  HTTP + SSE (127.0.0.1, token 鉴权)
-                                  ▼
-                          DSH Host Plugin
-                                  │  ctx.agents.create/resume + followup
-                                  ▼
-                          DSH Agent (本机 LLM + 工具)
-```
+## 迁移到另一台设备 / 分享给别人
 
-- `src/bridge/`：从 wechat-claude-code 移植的微信协议层 + 适配 DSH 的守护进程。
-- `src/index.ts`：DSH Host 插件，负责内部 API、Agent 生命周期、守护进程管理和模型工具。
-- `src/client/index.ts`：Web 管理面板（`settings.section` 槽位）。
+**只分享安装包、源码包和可选的偏好导出文件；绝不要复制整个私有数据目录。**
 
-## 安装
+安装包与平台无关，但目标设备仍须自行安装兼容 DSH；这不是包含 DSH、Node、模型和账号授权的“一键绿色版”。
 
-### 方式一：npm 一键安装（推荐）
+默认状态位置：`DSH_PROFILE_DIR/wechat-portable`；未设置该变量时为 `DSH_HOME/profiles/<profile>/wechat-portable`（`DSH_HOME` 默认为用户目录下的 `.dsh`）。可使用插件的绝对本地 `dataDir`，但它是本机配置，不在导出内容内。不同 profile 与原版数据目录隔离。
 
-```bash
-npm install @lanbaolu/dsh-wechat-bridge
-dsh plugin --profile web add @lanbaolu/dsh-wechat-bridge
-dsh web
+配置工具不会安装、启动 DSH 或申请权限。已安装包可以运行 `dsh-wechat-portable`；源码构建后也可直接使用：
+
+```text
+node lib/portable/cli.js doctor --profile desktop
+node lib/portable/cli.js export ./wechat-settings.json --profile desktop
+node lib/portable/cli.js import ./wechat-settings.json --profile desktop --workspace "本机已有工作目录的绝对路径"
+node lib/portable/cli.js import ./wechat-settings.json --profile desktop --workspace "本机已有工作目录的绝对路径" --confirm
 ```
 
-### 方式二：本地路径安装（开发/个人使用）
+- 使用自定义存储位置时，追加 `--data-dir "绝对本地目录"`。
+- 导入默认只预览；停止桥接后才可用 `--confirm` 写入。
+- 白名单只有用量尾注、拒绝通知和安抚消息的布尔/数值设置；不包括自由文本、提示词、模型、路径、权限、信任集或账号。
+- 新设备重新选择工作目录和 DSH 模型，**重新扫码**。不会迁移聊天上下文；原设备的凭据也不会因此自动撤销，请单独停止/解绑旧设备。
+- 导出文件不得覆盖已有文件，也不得写进私有状态目录。未知版本、额外字段、非法类型、超大 JSON、路径/凭据/权限注入均被拒绝。
 
-在 DSH profile 中安装本地包：
+更详细的边界与验收见 [安装和迁移](docs/portable/INSTALL-MIGRATE.md)、[验证记录](docs/portable/VALIDATION.md)。
 
-```bash
-git clone https://github.com/lanbaolu/dsh-wechat-bridge.git
-dsh plugin --profile web add /path/to/dsh-wechat-bridge
-dsh web
+## 从源码构建
+
+需要 Node **22.19+**（本机使用 24.21.0）及 pnpm 11。宿主 SDK 是开发期依赖；不是硬编码的另一份个人 DSH 源码。
+
+```text
+pnpm install --frozen-lockfile --ignore-scripts
+pnpm run verify
+pnpm pack --pack-destination dist
 ```
 
-或者使用超级注入器（开发模式）：
+构建/测试脚本只使用 Node，支持含空格和非 ASCII 的路径，不调用 Bash、不创建宿主源码软链接、不读取开发者个人 profile。测试子进程继承标准输入输出，以适应 Windows DSH 沙箱的管道限制。
 
-```bash
-dev_inject_plugin /path/to/dsh-wechat-bridge
-```
+运行时二维码依赖连同其许可证打入 tarball；DSH SDK 是由兼容宿主提供的 peer。离线使用仍需要已安装的 DSH 及其依赖；微信/模型连接需要网络。首次源码安装与构建依赖下载也需要网络，不宣称完整离线运行。
 
-### 方式三：从源码运行
+## 隐私与卸载
 
-```bash
-npm install
-npm run build        # host → lib/
-npm run build:client # client → lib/client.js
-npm run typecheck
-```
+- Linux/macOS 创建私有目录 0700、文件 0600；Windows 依赖当前用户目录继承的 ACL，**不会自动更改系统 ACL**。不要把状态放在共享盘、公共目录或多人可读位置。
+- 调试日志默认关闭；即使经过脱敏，日志、附件和会话仍是私密数据，不应公开上传。普通运行日志保留约 30 个日期文件。
+- 停止桥接、禁用/卸载插件即可停止接入。数据不自动删除，以免误删；解绑及数据清理必须由使用者自行核实后操作。
+- 本地管理端口只绑定回环地址；HTTP 面板另有同源/方法/自定义头限制。它们不是供公网或局域网开放的远程管理 API。
 
-> 注意：`build:client` 使用 `tsdown`，需要 Node.js 22.18+ 或 24.11+（CI 使用 22/24 验证）。运行时要求仍为 Node 18+。
+## 来源与许可
 
-## 使用
-
-### 1. 扫码绑定
-
-推荐在 DSH Web 设置页的「📱 微信桥接」面板中完成：
-
-1. 打开 **Settings / 设置** → **📱 微信桥接**。
-2. 填写 DSH 工作目录。
-3. 点击 **扫码绑定**，用微信扫描页面上的二维码。
-4. 绑定成功后直接点击 **启动**。
-
-也可以在 DSH 所在机器终端执行：
-
-```bash
-node lib/bridge/main.js setup
-```
-
-按提示用微信扫码，完成后选择 DSH 工作目录。
-
-### 2. 启动桥接
-
-在 DSH 对话中让模型执行：
-
-- `wechat_bridge_start`
-- `wechat_bridge_status`
-- `wechat_bridge_logs`
-- `wechat_bridge_stop`
-
-或者在 Web 设置页（`settings.section` 槽位）点击“启动 / 停止 / 重启”。
-
-### 3. 微信端命令
-
-| 命令 | 说明 |
-|------|------|
-| `/help` | 显示帮助 |
-| `/clear` | 清除当前 DSH 会话 |
-| `/new` | 开启全新会话（等价 `/clear`） |
-| `/stop` | 停止当前任务并清空排队消息 |
-| `/status` | 查看会话状态 |
-| `/cwd [路径]` | 查看 / 切换工作目录 |
-| `/model [名称]` | 查看 / 切换模型 |
-| `/prompt [内容]` | 查看 / 设置系统提示词 |
-| `/history [数量]` | 查看最近对话 |
-| `/send <路径>` | 发送本地文件到微信 |
-| `/trust <userId> [备注]` | 添加信任用户（manual 模式；仅 owner） |
-| `/distrust <userId>` | 吊销信任用户（仅 owner） |
-| `/trustlist` | 查看信任集（仅 owner） |
-| `/trustmode [模式]` | 查看/切换信任模式（owner-only / bootstrap / manual） |
-
-## 超时安抚配置
-
-DSH 长时间没有产出消息时，桥接会主动发一条"还在处理"的安抚消息（默认 5 分钟静默后、每 5 分钟一条，避免用户以为卡死）。嫌频繁或想自定义，可在 Web 面板「⏳ 超时安抚」区块调整，或直接编辑 `config.json` 的 `calm` 节：
-
-```jsonc
-{
-  "calm": {
-    "enabled": true,        // 是否启用安抚，默认 true
-    "silenceMs": 600000,    // 首次静默多久后安抚（毫秒），默认 300000（5 分钟）
-    "intervalMs": 900000,   // 两次安抚最小间隔（毫秒），默认同 silenceMs
-    "maxCount": 3,          // 每轮任务最多安抚次数，0/省略 = 不限制
-    "messages": [           // 自定义文案（随机取一条），留空用内置默认
-      "还在处理中，这个问题有点复杂，请再稍等一下",
-      "马上就好，正在收尾"
-    ]
-  }
-}
-```
-
-保存后即时生效（最长延迟数秒），无需重启守护进程。改动只在守护进程运行时展示于面板；若面板无「超时安抚」区块，请更新插件后重启 DSH。
-
-## 防休眠（preventSleep）
-
-默认关闭。开启后，守护进程运行期间会抑制系统休眠——锁屏/合盖不挂起，微信消息持续响应（适合挂机跑长任务）。
-
-- 面板「💤 防休眠」开关，或直接编辑 `config.json`：
-
-```jsonc
-{
-  "preventSleep": true
-}
-```
-
-- 平台实现：macOS `caffeinate` / Linux `systemd-inhibit` / Windows `SetThreadExecutionState`（尽力而为）。
-- 切换后需重启守护进程生效（面板「重启」按钮即可）。
-
-## 安全模型（多用户信任集）
-
-> iLink 微信协议的扫码绑定是 **bot 自身** 登录（不是用户配对）。因此"多用户"的边界在协议层之上划定：把可信微信用户的 `from_user_id` 加进**信任集**，放行/拒绝入站。
-
-### 信任模式（fail-closed 默认）
-
-| 模式 | 行为 | 适用 |
-|---|---|---|
-| `owner-only`（默认） | 只认绑定账号 owner 本人，陌生人一律拒绝 | 单用户，行为与旧版完全一致 |
-| `bootstrap` | 首个联系的陌生人自动入信任集（一次性），之后不再自动 | 快速开号试用 |
-| `manual` | 仅 owner 用 `/trust` 或 Web 面板显式添加的人可对话 | 正式多人使用 |
-
-- 信任集持久化在 `trust.json`（0600），`mode` 是唯一真相源；`config.json` 只存 `notifyRejected`。
-- **拒绝原则**：陌生人消息只记日志、不回复（不泄露任何内部信息）；可选 `notifyRejected: true` 让 owner 收到「陌生人尝试联系」提醒（Web 面板或 `/trustmode` 后由面板开关）。
-- **吊销即失效**：`/distrust` 或面板「吊销」后，该用户新消息立刻被拒绝；其历史会话文件保留只读（不丢历史）。
-
-### per-user 隔离
-
-- 每个受信用户（含 owner）一套独立：DSH 会话（`${botAccountId}::${userId}` 为 key）、会话文件、消息队列、上下文 token、`/history` `/status` `/cwd` `/model`。
-- A 的任务进行中，B 发消息不会被阻塞（独立队列）；A 的 `/yes` `/no` 只裁决 A 自己 agent 的待审批（审批 key 归属 session key），B 无权替 A 裁决。
-- 项目绑定两级粒度：Web 面板选择项目会话 → 对该 bot 下**所有**用户生效；微信内 `/session` 绑定 → 仅对当前用户生效。
-
-### 升级迁移
-
-- 旧单用户数据自动迁移：`sessions/<accountId>.json` → `sessions/<accountId>__<ownerUserId>.json`，`session-ids.json` 旧 key → `${accountId}::${ownerUserId}`，迁移留痕日志，绝不丢历史；无法确定 owner 的旧数据保留原样只读。
-
-> ⚠️ **验证状态（如实标注）**：信任集判定与迁移逻辑有纯函数单测覆盖（39 项）；
-> owner-only 模式已真机回归（行为与旧版一致）。**多用户路径（bootstrap 入集、双用户隔离并发）
-> 真机验证待补**——需要第二个微信账号走查，在此之前请仅在受控环境开启 `bootstrap`/`manual` 模式。
-
-## 数据目录
-
-默认 `~/.dsh/wechat-bridge/`（可用 `DSH_HOME` 调整）：
-
-```
-~/.dsh/wechat-bridge/
-├── accounts/       # 微信账号凭证（0600）
-├── sessions/       # 每个微信账号的本地会话状态
-├── session-ids.json # 微信账号 → DSH 持久化会话 ID 映射（用于重启后 resume）
-├── trust.json       # 多用户信任集（模式 + 信任用户，0600）
-├── context-tokens.json # per-user context_token（主动推送/审批通行证）
-├── pending-queue/  # 发送失败暂存队列
-├── daemon-port.json # 守护进程 notify 端点端口（token 鉴权）
-├── notify-stats.json # 主动通知每日配额计数
-├── config.json     # 工作目录 / 模型 / 系统提示词
-└── logs/           # 运行日志
-```
-
-## 安全说明
-
-- 守护进程与 DSH 插件之间的内部 API 只监听 `127.0.0.1`，并使用随机 token 鉴权。
-- 微信账号凭证仅保存在本机 `~/.dsh/wechat-bridge/accounts/`，权限为 0600。
-- 日志中的 token / secret / password 会自动脱敏。
-- 请勿把真实账号凭证、token 或日志提交到 Issue / PR。
-
-## 贡献
-
-欢迎提交 Issue 和 PR。请先阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md)，并查看 [`SECURITY.md`](SECURITY.md) 了解安全报告方式。
-
-## License
-
-[MIT](LICENSE)
+保留原 MIT 许可，详见 [LICENSE](LICENSE) 与 [UPSTREAM.md](UPSTREAM.md)。版本号为独立预览版，不沿用上游发布身份，不包含上游真实微信测试的保证。

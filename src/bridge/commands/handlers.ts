@@ -7,14 +7,15 @@ import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { validateOutboundFile } from '../safe-files.js';
 
 const HELP_TEXT = `可用命令：
 
 会话管理：
   /help             显示帮助
   /stop             停止当前对话并清空排队消息
-  /yes              批准 DSH 的权限请求（审批超时自动拒绝）
-  /no               拒绝 DSH 的权限请求
+  /yes <审批码>     一次性批准对应的权限请求（超时自动拒绝）
+  /no <审批码>      拒绝对应的权限请求
   /clear            清除当前会话并开启新会话
   /new              开启全新会话（等价 /clear）
   /reset            完全重置（包括工作目录等设置）
@@ -132,9 +133,9 @@ export function handleVersion(): CommandResult {
     const __dirname = fileURLToPath(new URL('.', import.meta.url));
     const pkg = JSON.parse(readFileSync(join(__dirname, '..', '..', '..', 'package.json'), 'utf-8'));
     const version = pkg.version || 'unknown';
-    return { reply: `dsh-wechat-bridge v${version}`, handled: true };
+    return { reply: `dsh-wechat-portable v${version}`, handled: true };
   } catch {
-    return { reply: 'dsh-wechat-bridge (version unknown)', handled: true };
+    return { reply: 'dsh-wechat-portable (version unknown)', handled: true };
   }
 }
 
@@ -162,23 +163,12 @@ export function handleSend(ctx: CommandContext, args: string): CommandResult {
     return { reply: '用法: /send <文件路径>\n例: /send ~/Documents/report.pdf\n     /send ./chart.png', handled: true };
   }
 
-  const resolved = args.startsWith('/')
-    ? args
-    : resolve(ctx.session.workingDirectory, args.replace(/^~/, homedir()));
-  if (!existsSync(resolved)) {
-    return { reply: `文件不存在: ${resolved}`, handled: true };
+  try {
+    const file = validateOutboundFile(args.replace(/^~/, homedir()), ctx.session.workingDirectory);
+    return { handled: true, sendFile: file };
+  } catch {
+    return { handled: true, reply: '无法发送：仅允许当前工作目录内的普通文档、图片或 MP4（≤25 MiB）；不允许隐藏文件、凭据目录、符号链接或网络路径。' };
   }
-
-  const stat = statSync(resolved);
-  if (stat.isDirectory()) {
-    return { reply: `这是一个目录，请指定文件: ${resolved}`, handled: true };
-  }
-
-  if (stat.size > 25 * 1024 * 1024) {
-    return { reply: `文件过大 (${(stat.size / 1024 / 1024).toFixed(1)}MB)，最大支持 25MB`, handled: true };
-  }
-
-  return { handled: true, sendFile: resolved };
 }
 
 function formatProjectLine(project: DshProjectSession, index: number): string {

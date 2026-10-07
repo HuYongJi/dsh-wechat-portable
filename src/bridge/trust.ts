@@ -16,6 +16,7 @@ import { readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync } from 'n
 import { join, dirname } from 'node:path';
 import { DATA_DIR } from './constants.js';
 import { logger } from './logger.js';
+import { atomicJson } from '../portable/paths.js';
 
 export type TrustMode = 'owner-only' | 'bootstrap' | 'manual';
 
@@ -91,11 +92,7 @@ export function loadTrust(path: string = TRUST_PATH): TrustFile {
 
 /** 持久化 trust.json（0600 权限，避免敏感 userId 暴露给同机其他用户）。 */
 export function saveTrust(file: TrustFile, path: string = TRUST_PATH): void {
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(file, null, 2) + '\n', 'utf8');
-  if (process.platform !== 'win32') {
-    chmodSync(path, FILE_MODE);
-  }
+  atomicJson(path, file);
 }
 
 /**
@@ -126,13 +123,16 @@ export interface DecideTrustInput {
 
 export function decideTrust(input: DecideTrustInput): TrustDecision {
   const { fromUserId, ownerUserId, file } = input;
-  if (!fromUserId) {
+  if (!isPlausibleUserId(fromUserId) || !isPlausibleUserId(ownerUserId)) {
     return { allowed: false, reason: 'rejected-stranger', file };
   }
   if (ownerUserId && fromUserId === ownerUserId) {
     return { allowed: true, reason: 'owner', file };
   }
-  if (file.trusted[fromUserId]) {
+  if (file.mode !== 'manual' && file.mode !== 'bootstrap') {
+    return { allowed: false, reason: 'rejected-stranger', file };
+  }
+  if (Object.hasOwn(file.trusted, fromUserId)) {
     // 刷新最近活跃时间。返回新对象（不清算原引用），调用方据此判定是否需要落盘。
     return {
       allowed: true,
@@ -219,5 +219,5 @@ export function listTrusted(file: TrustFile): TrustedView[] {
 /** 用于 owner /trust 校验：userId 看起来像 iLink 微信 userId（防止误传垃圾）。 */
 const USER_ID_PATTERN = /^[A-Za-z0-9_.@=-]{4,64}$/;
 export function isPlausibleUserId(s: string): boolean {
-  return USER_ID_PATTERN.test(s);
+  return USER_ID_PATTERN.test(s) && !['__proto__', 'constructor', 'prototype', 'toString', 'valueOf'].includes(s);
 }

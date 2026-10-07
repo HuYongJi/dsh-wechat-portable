@@ -14,7 +14,8 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "jsx": "react-jsx",
-    "sourceMap": true
+    "sourceMap": false,
+    "noEmitOnError": true
   },
   "include": ["src"]
 }
