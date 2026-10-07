@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing version tag matching package.json, for example v0.1.0-alpha.7'
+        description: 'Existing version tag matching package.json, for example v0.1.0-alpha.8'
         required: true
         type: string
 

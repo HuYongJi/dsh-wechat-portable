@@ -40,13 +40,13 @@ pnpm run release:pack --out-dir dist/release-check-2
 
 1. 审核本次全部改动，确保只提交有意发布的内容。不要把未完成的其他任务、账号、日志或聊天记录打进版本。
 2. 将 `package.json` 的版本、README、变更记录及面板版本文案保持一致。**已经分发过同一版本但内容有变化时，应增加版本号**，不要复用旧版本冒充同一安装包。
-3. 在审核后的提交上创建与包版本完全一致的 `v版本号` tag。例如包版本为 `0.1.0-alpha.7` 时，tag 必须为 `v0.1.0-alpha.7`；不能只创建 tag 而不更新包版本。
+3. 在审核后的提交上创建与包版本完全一致的 `v版本号` tag。例如包版本为 `0.1.0-alpha.8` 时，tag 必须为 `v0.1.0-alpha.8`；不能只创建 tag 而不更新包版本。
 4. 经仓库维护者确认后，推送提交及该 tag 到自己的 `origin`。不要使用 `git push --tags` 把继承的上游历史 tag 一并发布。
 
 本地可以提前验证 tag/version 一致性。下面只是版本示例，须先把包版本实际更新为同一值：
 
 ```text
-pnpm run release:pack --tag v0.1.0-alpha.7 --out-dir dist/alpha7-check
+pnpm run release:pack --tag v0.1.0-alpha.8 --out-dir dist/alpha8-check
 ```
 
 版本不符时脚本失败；它不会创建 tag、提交代码、推送仓库、上传附件或安装到个人 DSH profile。
@@ -71,7 +71,7 @@ pnpm run release:pack --tag v0.1.0-alpha.7 --out-dir dist/alpha7-check
 发布成功后，Release 正文和 `INSTALL-URL.txt` 都包含这种固定版本地址：
 
 ```text
-https://github.com/HuYongJi/dsh-wechat-portable/releases/download/v0.1.0-alpha.7/dsh-wechat-portable-0.1.0-alpha.7.tgz
+https://github.com/HuYongJi/dsh-wechat-portable/releases/download/v0.1.0-alpha.8/dsh-wechat-portable-0.1.0-alpha.8.tgz
 ```
 
 这只是当前版本地址格式示例，**附件实际发布之前会返回 404**。以成功发布的 Release 中提供的地址为准；不要拼接 `releases/latest`，因为 Alpha 属于预发布。Fork 发布时，工作流使用实际 `GITHUB_REPOSITORY` 生成链接；本地打包可通过 `--repository OWNER/REPO` 明确指定目标仓库。

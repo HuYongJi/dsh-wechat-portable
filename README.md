@@ -1,4 +1,4 @@
-# DSH WeChat Portable · 0.1.0-alpha.7
+# DSH WeChat Portable · 0.1.0-alpha.8
 
 面向 **DSH Desktop 0.2.0-rc.2** 的独立社区微信桥接预览版。基于 lanbaolu/dsh-wechat-bridge 0.9.1（MIT）改造；不是 DeepSeek、微信或上游作者的官方产品，也不代表获得其背书。
 
@@ -25,10 +25,10 @@
 6. 设置中打开“微信桥接（Portable）”，选择一个**本机已存在、专用的工作目录**，获取二维码并在微信确认。
 7. 扫码成功后仍保持停止；检查模型选择与工作目录，再手动启动。
 
-Alpha.7 发布后的固定安装地址如下；**只有对应 Release 发布成功后才可用**，请先确认 Releases 中存在该附件。预览版不使用 `releases/latest`，避免跳到其他版本：
+Alpha.8 发布后的固定安装地址如下；**只有对应 Release 发布成功后才可用**，请先确认 Releases 中存在该附件。预览版不使用 `releases/latest`，避免跳到其他版本：
 
 ```text
-https://github.com/HuYongJi/dsh-wechat-portable/releases/download/v0.1.0-alpha.7/dsh-wechat-portable-0.1.0-alpha.7.tgz
+https://github.com/HuYongJi/dsh-wechat-portable/releases/download/v0.1.0-alpha.8/dsh-wechat-portable-0.1.0-alpha.8.tgz
 ```
 
 安装包已包含编译后的 Host/Client 和二维码运行依赖，使用者无需克隆仓库、安装开发依赖或编译源码。**这不等于仓库主页地址的源码安装已通过验证。**

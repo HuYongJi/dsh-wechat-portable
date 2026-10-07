@@ -13,6 +13,9 @@ dist/
 !.env.example
 *.pem
 *.key
+# Intentionally public localhost-only TLS regression fixtures, never deployment keys.
+!/tests/fixtures/localhost-test-cert.pem
+!/tests/fixtures/localhost-test-key.pem
 
 # OS / editor
 .DS_Store

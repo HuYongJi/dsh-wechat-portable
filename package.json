@@ -1,6 +1,6 @@
 {
   "name": "dsh-wechat-portable",
-  "version": "0.1.0-alpha.7",
+  "version": "0.1.0-alpha.8",
   "description": "Community portable WeChat bridge for DSH 0.2; derived from lanbaolu/dsh-wechat-bridge (MIT).",
   "type": "module",
   "license": "MIT",
