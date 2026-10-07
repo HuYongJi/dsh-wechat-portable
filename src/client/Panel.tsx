@@ -152,7 +152,7 @@ export function WechatBridgePanel({ control }: WechatBridgePanelProps): React.JS
   const disabled = !!busy || !status?.ready || !!qr
   return (
     <section style={panelStyle} aria-label="Portable 微信桥接">
-      <h3 style={{ marginTop: 0 }}>微信桥接 · 单用户 Alpha.6</h3>
+      <h3 style={{ marginTop: 0 }}>微信桥接 · 单用户 Alpha.7</h3>
       <p style={hintStyle}>通过 DSH 原生 Remote / Desktop IPC 管理当前 profile，不使用浏览器 HTTP 后备接口。</p>
       <div aria-live="polite">
         {status ? <>

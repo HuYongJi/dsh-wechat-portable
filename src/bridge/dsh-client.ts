@@ -37,9 +37,11 @@ export interface DshProjectSession {
   sessionId: string;
   workspaceId: string;
   workspaceTitle: string;
+  /** Client-visible session title, absent before a title is available. */
+  title?: string;
   path: string;
   cwd?: string;
-  createdAt: string;
+  createdAt: string | number;
   live: boolean;
   current?: boolean;
 }

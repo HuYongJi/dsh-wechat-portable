@@ -1,9 +1,11 @@
 {
   "name": "dsh-wechat-portable",
-  "version": "0.1.0-alpha.6",
+  "version": "0.1.0-alpha.7",
   "description": "Community portable WeChat bridge for DSH 0.2; derived from lanbaolu/dsh-wechat-bridge (MIT).",
   "type": "module",
   "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/HuYongJi/dsh-wechat-portable.git" },
+  "packageManager": "pnpm@11.7.0",
   "engines": { "node": ">=22.19.0" },
   "main": "./lib/index.js",
   "types": "./lib/types/index.d.ts",
@@ -65,6 +67,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node scripts/test.mjs",
     "verify": "node scripts/verify.mjs",
+    "release:pack": "node scripts/release.mjs",
     "prepack": "node scripts/verify.mjs"
   },
   "exports": {

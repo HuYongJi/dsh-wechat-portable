@@ -4,22 +4,23 @@
 
 ## 开发环境
 
-- Node.js >= 18
-- npm
-- 可选：本地 DSH 环境（用于真机联调）
+- Node.js >= 22.19（Release runner 使用 24.21.0）
+- pnpm 11.7.0，使用仓库提交的 pnpm 锁文件
+- 可选：本地 DSH 0.2.0-rc.2 环境（用于真机联调）
 
-```bash
-npm install
-npm run typecheck
-npm run build
-npm run build:client
+```text
+pnpm install --frozen-lockfile --ignore-scripts
+pnpm run verify
+pnpm run release:pack
 ```
+
+`release:pack` 验证后生成本地 `dist/release/` 附件，不会发布到 GitHub 或 npm，也不会安装到个人 DSH。输出目录必须为空。维护者的 tag/Release 发布流程见 [发布指南](docs/portable/RELEASING.md)。
 
 ## 提交 PR
 
 1. Fork 本仓库并创建功能分支（`feat/xxx`、`fix/xxx`）。
 2. 修改代码，保持 TypeScript 严格模式通过。
-3. 本地跑通 `typecheck` 与 `build`。
+3. 本地跑通 `verify` 与 `release:pack`，包含全部回归和打包入口检查；不要跳过失败测试。
 4. 提交信息使用简洁的祈使句，例如 `fix: batch WeChat streaming replies`。
 5. 创建 PR 时填写模板，说明改动和测试方式。
 

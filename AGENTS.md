@@ -26,12 +26,15 @@ DSH（DeepSeek Harness）微信桥接插件。通过 iLink Bot 微信协议层�
 
 ## 常用命令
 
-```bash
-npm install
-npm run typecheck
-npm run build
-npm run build:client
+使用 Node 22.19+ 与 pnpm 11.7.0，只维护 pnpm 锁文件。
+
+```text
+pnpm install --frozen-lockfile --ignore-scripts
+pnpm run verify
+pnpm run release:pack
 ```
+
+`release:pack` 只生成本地预编译包、校验和及安装链接；推送 tag 和创建 GitHub Release 需要维护者明确决定。分发使用 Release 的 `.tgz` 附件直链，不承诺仓库主页源码直装；流程见 `docs/portable/RELEASING.md`。
 
 ## 约定
 

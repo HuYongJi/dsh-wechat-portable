@@ -112,6 +112,50 @@ test('IDs and unique names switch; ambiguous names and short IDs never pick the 
   assert.equal(ctx.calls.at(-1), 'detach')
 })
 
+test('session commands display client titles rather than repeated workspace names and full paths', async () => {
+  const projects = [
+    { ...item('session-aaaa1111'), title: '设计微信会话管理', current: true, live: true },
+    { ...item('session-bbbb2222'), title: '排查登录问题 🧪', live: true },
+    item('session-cccc3333'),
+  ]
+  const ctx = commandContext({ listProjects: async () => projects, getStatus: async () => ({ selectedProject: projects[0] }) })
+  const list = (await route(ctx, '/sessions')).reply
+  assert.match(list, /1\. 【当前】设计微信会话管理\n   Project · aaaa1111/)
+  assert.match(list, /2\. 排查登录问题 🧪（已打开）/)
+  assert.match(list, /3\. 未命名会话/)
+  assert.ok(!list.includes('/work/project'))
+  assert.deepEqual(ctx.session.sessionChoices, projects.map(p => p.sessionId))
+  assert.match((await route(ctx, '/session')).reply, /当前会话：设计微信会话管理/)
+  projects[1].live = false
+  assert.match((await route(ctx, '/switch 排查登录问题 🧪')).reply, /已切换到会话：排查登录问题 🧪/)
+  assert.deepEqual(ctx.calls, ['session-bbbb2222'])
+})
+
+test('title matching prefers unique titles over project names and refuses duplicate titles', async () => {
+  const projects = [
+    { ...item('session-aaaa1111', 'Shared'), title: '同名标题' },
+    { ...item('session-bbbb2222', 'Shared'), title: '同名标题' },
+    { ...item('session-cccc3333', 'Other'), title: 'Shared' },
+  ]
+  const ctx = commandContext({ listProjects: async () => projects })
+  assert.match((await route(ctx, '/switch 同名标题')).reply, /多个会话/)
+  assert.deepEqual(ctx.calls, [])
+  assert.match((await route(ctx, '/switch Shared')).reply, /✅/)
+  assert.deepEqual(ctx.calls, ['session-cccc3333'])
+  await route(ctx, '/sessions')
+  projects[0].title = '电脑端刚改的标题'
+  assert.match((await route(ctx, '/switch 1')).reply, /电脑端刚改的标题/)
+  assert.equal(ctx.calls.at(-1), 'session-aaaa1111', 'renaming never changes the delivered numeric snapshot')
+  assert.match((await route(ctx, '/switch 电脑端刚改的标题')).reply, /✅/)
+})
+
+test('legacy Host responses without title still show usable unnamed sessions', async () => {
+  const ctx = commandContext({ getStatus: async () => ({ selectedProject: item('session-aaaa1111') }) })
+  assert.match((await route(ctx, '/session')).reply, /当前会话：未命名会话\n   Project · aaaa1111/)
+  assert.match((await route(ctx, '/switch 未命名会话')).reply, /多个会话/)
+  assert.deepEqual(ctx.calls, [])
+})
+
 function managerFixture(overrides = {}) {
   let local = session()
   let current = 'old-1111'

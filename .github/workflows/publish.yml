@@ -1,38 +1,96 @@
-name: publish
+name: GitHub Release
 
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag matching package.json, for example v0.1.0-alpha.7'
+        required: true
+        type: string
 
 permissions:
-  id-token: write # Required for npm Trusted Publishing via OIDC
   contents: read
 
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
-  publish:
+  build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - name: Checkout
+      - name: Checkout the existing release tag
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          persist-credentials: false
 
       - name: Use Node.js 24
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
+          node-version: '24.21.0'
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Use pinned pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: '11.7.0'
+          run_install: false
 
-      - name: Typecheck
-        run: npm run typecheck
+      - name: Install locked dependencies without lifecycle scripts
+        run: pnpm install --frozen-lockfile --ignore-scripts
 
-      - name: Build host
-        run: npm run build
+      - name: Verify, build and pack the tagged version
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: pnpm run release:pack --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY"
 
-      - name: Build client
-        run: npm run build:client
+      - name: Upload only reviewed release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            dist/release/*.tgz
+            dist/release/SHA256SUMS.txt
+            dist/release/INSTALL-URL.txt
+            dist/release/RELEASE-NOTES.md
+            dist/release/PACKAGE-FILES.txt
+            dist/release/RELEASE-AUDIT.json
 
-      - name: Publish to npm
-        run: npm publish --provenance --access public
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The write token is not exposed to dependency installation or build scripts.
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist/release
+
+      - name: Create a versioned Release without replacing existing assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        shell: bash
+        run: |
+          flags=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            flags+=(--prerelease --latest=false)
+          fi
+          gh release create "$RELEASE_TAG" \
+            dist/release/*.tgz \
+            dist/release/SHA256SUMS.txt \
+            dist/release/INSTALL-URL.txt \
+            dist/release/PACKAGE-FILES.txt \
+            dist/release/RELEASE-AUDIT.json \
+            --verify-tag --title "$RELEASE_TAG" \
+            --notes-file dist/release/RELEASE-NOTES.md "${flags[@]}"

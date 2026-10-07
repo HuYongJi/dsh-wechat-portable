@@ -1,5 +1,6 @@
 import type { CommandContext, CommandResult } from './router.js';
 import type { DshProjectSession } from '../dsh-client.js';
+import { cleanSessionLabel, sessionDisplayTitle, formatSessionListItem, formatSessionSummary } from '../session-display.js';
 import { loadConfig, saveConfig } from '../config.js';
 
 import { isPlausibleUserId, addTrusted, removeTrusted, listTrusted } from '../trust.js';
@@ -17,8 +18,8 @@ const HELP_TEXT = `可用命令：
   /yes <审批码>     一次性批准对应的权限请求（超时自动拒绝）
   /no <审批码>      拒绝对应的权限请求
   /new              创建并进入全新会话（保留旧会话）
-  /sessions         查看会话列表（标记当前会话）
-  /switch <序号|ID|项目名>  切换到已有会话
+  /sessions         查看客户端会话标题（标记当前会话）
+  /switch <序号|ID|标题>  切换到已有会话（兼容项目名）
   /clear            清空当前上下文（不删除 DSH 历史）
   /reset            完全重置（包括工作目录等设置）
   /status           查看当前会话状态
@@ -184,10 +185,6 @@ export function handleSend(ctx: CommandContext, args: string): CommandResult {
   }
 }
 
-function formatProjectLine(project: DshProjectSession, index: number): string {
-  return `${index + 1}. ${project.current ? '【当前】' : ''}${project.workspaceTitle} · ${project.path} · ${project.sessionId.slice(-8)}${project.live && !project.current ? '（已打开）' : ''}`;
-}
-
 export async function handleSessionList(ctx: CommandContext): Promise<CommandResult> {
   if (!ctx.listProjects) {
     return { reply: '当前守护进程不支持项目会话列表（请升级插件并重启桥接）。', handled: true };
@@ -200,9 +197,9 @@ export async function handleSessionList(ctx: CommandContext): Promise<CommandRes
     if (projects.length === 0) {
       return { reply: '暂无可用会话。发送 /new 或“新建会话”即可创建。', handled: true, sessionChoices: [] };
     }
-    const lines = projects.map(formatProjectLine);
+    const lines = projects.map(formatSessionListItem);
     return {
-      reply: `📁 会话列表（共 ${projects.length} 个）:\n\n${lines.join('\n')}\n\n切换：/switch <序号或ID> 或“切换会话 2”\n新建：/new · 清空上下文：/clear`,
+      reply: `📁 会话列表（共 ${projects.length} 个）:\n\n${lines.join('\n\n')}\n\n切换：/switch <序号、ID或唯一标题> 或“切换会话 2”\n新建：/new · 清空上下文：/clear`,
       handled: true,
       sessionChoices: projects.map((project) => project.sessionId),
     };
@@ -220,10 +217,10 @@ export async function handleSession(ctx: CommandContext, args: string): Promise<
     }
     try {
       const status = await ctx.getStatus();
-      const selected = (status as { selectedProject?: { workspaceTitle?: string; path?: string; sessionId?: string } | null }).selectedProject;
+      const selected = (status as { selectedProject?: Partial<DshProjectSession> | null }).selectedProject;
       if (selected?.sessionId) {
         return {
-          reply: `当前会话：${selected.workspaceTitle || ''} · ${selected.path || ''} · ${selected.sessionId.slice(-8)}\n查看列表：/sessions · 清空上下文：/clear`,
+          reply: `当前会话：${formatSessionSummary({ ...selected, sessionId: selected.sessionId })}\n查看列表：/sessions · 清空上下文：/clear`,
           handled: true,
         };
       }
@@ -271,8 +268,9 @@ export async function handleSession(ctx: CommandContext, args: string): Promise<
       const id = ctx.session.sessionChoices[Number(arg) - 1];
       matches = projects.filter((project) => project.sessionId === id);
     } else {
+      const titles = projects.filter((p) => sessionDisplayTitle(p) === cleanSessionLabel(arg));
       const names = projects.filter((p) => p.workspaceTitle === arg || p.path === arg);
-      matches = shortIds.length ? shortIds : names.length ? names : projects.filter((p) => p.path.includes(arg));
+      matches = shortIds.length ? shortIds : titles.length ? titles : names.length ? names : projects.filter((p) => p.path.includes(arg));
     }
     if (matches.length > 1) {
       return { reply: `匹配到多个会话：${arg}。请用 /sessions 查看后选择序号或完整 ID。`, handled: true };
@@ -285,7 +283,7 @@ export async function handleSession(ctx: CommandContext, args: string): Promise<
     const result = await ctx.selectProject(target.sessionId);
     if (result.ok === false) throw new Error(String(result.error || '切换被拒绝'));
     return {
-      reply: `✅ 已绑定项目会话：${target.workspaceTitle} · ${target.path}${result.daemon ? `\n${result.daemon}` : ''}`,
+      reply: `✅ 已切换到会话：${formatSessionSummary(target)}${result.daemon ? `\n${result.daemon}` : ''}`,
       handled: true,
     };
   } catch (err) {

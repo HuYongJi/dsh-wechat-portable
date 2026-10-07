@@ -20,13 +20,16 @@ import { homedir } from 'node:os'
 import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
+import { SessionId, type Session, type SessionHeader, type SessionEvent } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { AgentHandle } from '@deepseek-ai/dsh-agent'
 import { createApprovalManager } from './approval.js'
 import { createWechatAgentSetup } from './agent-setup.js'
 import { registerNativeControl } from './host/control.js'
 import { createConversationManager } from './host/conversations.js'
+import { readClientSessionTitle, type SessionTitleSources } from './host/session-titles.js'
+import { formatSessionListItem, formatSessionSummary } from './bridge/session-display.js'
+import type { DshProjectSession } from './bridge/dsh-client.js'
 import type { Session as BridgeSession } from './bridge/session.js'
 import { ControlError, parseControlValue, type ControlSetupStatus } from './host/contract.js'
 import { resolveDataDir, defaultWorkingDirectory, ensurePrivateDir, atomicJson, requireWorkspace } from './portable/paths.js'
@@ -106,15 +109,7 @@ interface WebRouteLike {
   handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
 }
 
-interface ProjectSessionItem {
-  sessionId: string
-  workspaceId: string
-  workspaceTitle: string
-  path: string
-  cwd?: string
-  createdAt: string
-  live: boolean
-}
+type ProjectSessionItem = DshProjectSession
 
 const PLUGIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -496,41 +491,35 @@ export function apply(ctx: Context, config: Config): void {
       | undefined
     if (!registry?.list) return []
 
-    const sessionsService = ctx.get('sessions') as
-      | { list(): Array<{ id: unknown; header: { id?: unknown; cwd?: string; createdAt?: string } }> }
-      | undefined
     const persistence = ctx.get('sessionPersistence') as
-      | { listSnapshots?: () => Promise<Array<{ header: { id: unknown; cwd?: string; createdAt?: string } }>> }
+      | { list(): Promise<readonly { header: SessionHeader }[]> }
       | undefined
-
-    const headerById = new Map<string, { cwd?: string; createdAt?: string }>()
-    const liveIds = new Set<string>()
-
-    for (const session of sessionsService?.list() ?? []) {
-      const id = String(session.id ?? session.header.id)
-      if (!id) continue
-      liveIds.add(id)
-      headerById.set(id, {
-        cwd: session.header.cwd,
-        createdAt: session.header.createdAt,
-      })
-    }
-
-    if (persistence?.listSnapshots) {
+    const headerById = new Map<string, SessionHeader>()
+    if (persistence?.list) {
       try {
-        for (const snap of await persistence.listSnapshots()) {
-          const id = String(snap.header.id)
-          if (!id) continue
-          if (!headerById.has(id)) {
-            headerById.set(id, {
-              cwd: snap.header.cwd,
-              createdAt: snap.header.createdAt,
-            })
-          }
+        // SDK 0.2 exposes list(), not listSnapshots(). Keep complete headers:
+        // the archived title cache validates their full lifecycle identity.
+        for (const snap of await persistence.list()) {
+          if (snap.header.id) headerById.set(String(snap.header.id), snap.header)
         }
       } catch (err) {
         debugLog('listProjectSessions snapshots failed', { error: err instanceof Error ? err.message : String(err) })
       }
+    }
+
+    // Read live sessions after the asynchronous stored listing. An opened or
+    // renamed session must take precedence over a stale archived title.
+    const sessionsService = ctx.get('sessions') as { list(): readonly Session[] } | undefined
+    const liveById = new Map<string, Session>()
+    for (const session of sessionsService?.list() ?? []) {
+      const id = String(session.id ?? session.header.id)
+      if (!id) continue
+      liveById.set(id, session)
+      headerById.set(id, session.header)
+    }
+    const titles: SessionTitleSources = {
+      projections: ctx.get('sessionProjections') as SessionTitleSources['projections'],
+      cache: ctx.get('sessionProjectionCache') as SessionTitleSources['cache'],
     }
 
     const items: ProjectSessionItem[] = []
@@ -542,10 +531,11 @@ export function apply(ctx: Context, config: Config): void {
           sessionId,
           workspaceId: ws.id,
           workspaceTitle: ws.title,
+          title: readClientSessionTitle(titles, header, liveById.get(sessionId)),
           path: ws.path,
           cwd: header?.cwd || ws.path,
-          createdAt: header?.createdAt || ws.createdAt,
-          live: liveIds.has(sessionId),
+          createdAt: header?.createdAt ?? ws.createdAt,
+          live: liveById.has(sessionId),
         })
       }
     }
@@ -564,6 +554,7 @@ export function apply(ctx: Context, config: Config): void {
       sessionId: selectedId,
       workspaceId: item.workspaceId,
       workspaceTitle: item.workspaceTitle,
+      title: item.title,
       path: item.path,
     }
   }
@@ -595,7 +586,7 @@ export function apply(ctx: Context, config: Config): void {
         accountId,
         selectedSessionId: sessionId,
         project: item,
-        message: `已经在项目 ${item.workspaceTitle} 中。`,
+        message: `已经在该会话中：${formatSessionSummary(item)}`,
       }
     }
 
@@ -614,7 +605,7 @@ export function apply(ctx: Context, config: Config): void {
       accountId,
       selectedSessionId: sessionId,
       project: item,
-      message: `已进入项目 ${item.workspaceTitle}（${item.path}），后续对话会记录到这个项目。`,
+      message: `已进入会话：${formatSessionSummary(item)}\n后续对话会记录到这个会话。`,
     }
   }
 
@@ -1920,7 +1911,7 @@ export function apply(ctx: Context, config: Config): void {
 
     ctx.tools.register(defineTool({
       name: 'wechat_bridge_list_projects',
-      description: '列出 DSH 中可进入/可绑定的项目会话（含项目名、路径、会话 ID）。当用户询问“有哪些项目”“看看我有什么项目”“我要看下项目”“我在哪个项目”“想继续某个项目”“有个任务想做”等意图，或用户描述内容可能对应某个项目时，都应调用此工具查看项目，不要要求用户使用固定句式。',
+      description: '列出 DSH 中可进入/可绑定的项目会话（优先显示客户端会话标题，含项目名、路径、会话 ID）。当用户询问“有哪些项目”“看看我有什么项目”“我要看下项目”“我在哪个项目”“想继续某个项目”“有个任务想做”等意图，或用户描述内容可能对应某个项目时，都应调用此工具查看项目，不要要求用户使用固定句式。',
       parameters: {},
       output: {
         schema: {
@@ -1938,6 +1929,7 @@ export function apply(ctx: Context, config: Config): void {
                 properties: {
                   sessionId: { type: 'string' as const, required: true as const },
                   workspaceTitle: { type: 'string' as const, required: true as const },
+                  title: { type: 'string' as const },
                   path: { type: 'string' as const, required: true as const },
                   live: { type: 'boolean' as const, required: true as const },
                 },
@@ -1945,11 +1937,11 @@ export function apply(ctx: Context, config: Config): void {
             },
           },
         },
-        render: (_args: unknown, value: { projects: Array<{ sessionId: string; workspaceTitle: string; path: string; live: boolean }> }) => [{
+        render: (_args: unknown, value: { projects: Array<{ sessionId: string; workspaceTitle: string; title?: string; path: string; live: boolean }> }) => [{
           type: 'text' as const,
           text: value.projects.length === 0
             ? '当前没有可绑定的项目会话。'
-            : `📁 可进入的项目会话（${value.projects.length} 个）：\n` + value.projects.map((p, i) => `${i + 1}. ${p.workspaceTitle} · ${p.path} · ${p.sessionId.slice(-8)}`).join('\n'),
+            : `📁 可进入的项目会话（${value.projects.length} 个）：\n\n` + value.projects.map(formatSessionListItem).join('\n\n'),
         }],
       },
       execute: async () => {
@@ -1960,6 +1952,7 @@ export function apply(ctx: Context, config: Config): void {
           projects: items.map((item) => ({
             sessionId: item.sessionId,
             workspaceTitle: item.workspaceTitle,
+            ...(item.title === undefined ? {} : { title: item.title }),
             path: item.path,
             live: item.live,
           })),

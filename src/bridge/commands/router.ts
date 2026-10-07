@@ -99,7 +99,7 @@ export async function routeCommand(ctx: CommandContext): Promise<CommandResult> 
     case 'projects':
       return handleSessionList(ctx);
     case 'switch':
-      if (!args) return { handled: true, reply: '用法：/switch <序号、ID或唯一项目名>\n先用 /sessions 查看列表。' };
+      if (!args) return { handled: true, reply: '用法：/switch <序号、ID或唯一标题>（兼容项目名）\n先用 /sessions 查看列表。' };
       return handleSession(ctx, args);
     case 'session':
       return handleSession(ctx, args);
