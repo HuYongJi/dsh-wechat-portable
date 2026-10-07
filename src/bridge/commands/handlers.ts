@@ -1,10 +1,10 @@
 import type { CommandContext, CommandResult } from './router.js';
 import type { DshProjectSession } from '../dsh-client.js';
 import { loadConfig, saveConfig } from '../config.js';
-import { DEFAULT_WORKING_DIR } from '../constants.js';
+
 import { isPlausibleUserId, addTrusted, removeTrusted, listTrusted } from '../trust.js';
-import { readFileSync, existsSync, statSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { validateOutboundFile } from '../safe-files.js';
@@ -16,8 +16,10 @@ const HELP_TEXT = `可用命令：
   /stop             停止当前对话并清空排队消息
   /yes <审批码>     一次性批准对应的权限请求（超时自动拒绝）
   /no <审批码>      拒绝对应的权限请求
-  /clear            清除当前会话并开启新会话
-  /new              开启全新会话（等价 /clear）
+  /new              创建并进入全新会话（保留旧会话）
+  /sessions         查看会话列表（标记当前会话）
+  /switch <序号|ID|项目名>  切换到已有会话
+  /clear            清空当前上下文（不删除 DSH 历史）
   /reset            完全重置（包括工作目录等设置）
   /status           查看当前会话状态
   /history [数量]   查看对话记录（默认最近20条）
@@ -31,15 +33,15 @@ const HELP_TEXT = `可用命令：
   /model [名称]     查看或切换模型
   /prompt [内容]    查看或设置系统提示词（全局生效）
 
-多用户信任（仅 owner 可见）：
-  /trust <userId> [备注]  添加一个信任用户（手动模式生效）
-  /distrust <userId>      吊销一个信任用户
-  /trustlist              查看当前信任集
-  /trustmode [owner-only|bootstrap|manual]  查看或切换信任模式
+兼容命令：
+  /sessionlist、/projects  同 /sessions
+  /session [序号|ID|off]  切换会话 / 查看当前 / 解除绑定
 
-项目绑定：
-  /sessionlist      列出可绑定的 DSH 项目会话
-  /session [序号|ID|off]  绑定项目会话 / 查看当前 / 解除绑定
+也可直接发送：
+  新建会话 · 查看会话列表 · 切换会话 2 · 清空上下文
+  当前会话 · 停止当前任务 · 会话帮助
+仅整条消息匹配短语时执行；序号来自最近一次查看的列表。
+新建、清空、切换会停止当前任务并丢弃排队消息。
 
 其他：
   /version          查看版本信息
@@ -50,15 +52,24 @@ export function handleHelp(_args: string): CommandResult {
   return { reply: HELP_TEXT, handled: true };
 }
 
-export function handleClear(ctx: CommandContext): CommandResult {
-  const newSession = ctx.clearSession();
-  Object.assign(ctx.session, newSession);
-  return { reply: '✅ 会话已清除，下次消息将开始新会话。', handled: true };
+export async function handleClear(ctx: CommandContext): Promise<CommandResult> {
+  try {
+    await ctx.clearContext();
+    return { reply: '✅ 上下文已清空，下次消息将开始新会话。工作目录和模型设置保留，DSH 历史会话未删除。', handled: true };
+  } catch {
+    return { reply: '⚠️ 清空上下文失败，请检查电脑端状态后重试。', handled: true };
+  }
 }
 
-/** Alias for /clear, matching the common “/new opens a fresh session” convention. */
-export function handleNew(ctx: CommandContext): CommandResult {
-  return handleClear(ctx);
+export async function handleNew(ctx: CommandContext): Promise<CommandResult> {
+  try {
+    const result = await ctx.createSession();
+    if (result.ok === false) throw new Error('create refused');
+    const id = typeof result.sessionId === 'string' ? `（${result.sessionId.slice(-8)}）` : '';
+    return { reply: `✅ 已创建并进入新会话${id}。旧会话已保留，可用 /sessions 查看并切回。`, handled: true };
+  } catch {
+    return { reply: '⚠️ 新建会话失败，请检查电脑端模型与工作目录设置后重试。', handled: true };
+  }
 }
 
 export function handleCwd(ctx: CommandContext, args: string): CommandResult {
@@ -104,11 +115,13 @@ export function handleHistory(ctx: CommandContext, args: string): CommandResult 
 }
 
 /** 完全重置会话（包括工作目录等设置） */
-export function handleReset(ctx: CommandContext): CommandResult {
-  const newSession = ctx.clearSession();
-  newSession.workingDirectory = DEFAULT_WORKING_DIR;
-  Object.assign(ctx.session, newSession);
-  return { reply: '✅ 会话已完全重置，所有设置恢复默认。', handled: true };
+export async function handleReset(ctx: CommandContext): Promise<CommandResult> {
+  try {
+    await ctx.clearContext(true);
+    return { reply: '✅ 上下文及会话设置已重置为桥接默认值，DSH 历史会话未删除。', handled: true };
+  } catch {
+    return { reply: '⚠️ 重置失败，请检查电脑端状态后重试。', handled: true };
+  }
 }
 
 /** 撤销最近 N 条对话 */
@@ -172,7 +185,7 @@ export function handleSend(ctx: CommandContext, args: string): CommandResult {
 }
 
 function formatProjectLine(project: DshProjectSession, index: number): string {
-  return `${index + 1}. ${project.workspaceTitle} · ${project.path} · ${project.sessionId.slice(-8)}`;
+  return `${index + 1}. ${project.current ? '【当前】' : ''}${project.workspaceTitle} · ${project.path} · ${project.sessionId.slice(-8)}${project.live && !project.current ? '（已打开）' : ''}`;
 }
 
 export async function handleSessionList(ctx: CommandContext): Promise<CommandResult> {
@@ -181,13 +194,17 @@ export async function handleSessionList(ctx: CommandContext): Promise<CommandRes
   }
   try {
     const projects = await ctx.listProjects();
+    // Invalidate old numbering before delivery, so a partial/failed reply cannot
+    // silently use either an unseen new list or the previous list's indices.
+    ctx.updateSession({ sessionChoices: undefined });
     if (projects.length === 0) {
-      return { reply: '没有可绑定的项目会话。\n请先在 DSH Web 端创建/打开一个项目对话。', handled: true };
+      return { reply: '暂无可用会话。发送 /new 或“新建会话”即可创建。', handled: true, sessionChoices: [] };
     }
     const lines = projects.map(formatProjectLine);
     return {
-      reply: `📁 可绑定项目会话（共 ${projects.length} 个）:\n\n${lines.join('\n')}\n\n绑定：/session <序号或ID>\n解除：/session off`,
+      reply: `📁 会话列表（共 ${projects.length} 个）:\n\n${lines.join('\n')}\n\n切换：/switch <序号或ID> 或“切换会话 2”\n新建：/new · 清空上下文：/clear`,
       handled: true,
+      sessionChoices: projects.map((project) => project.sessionId),
     };
   } catch (err) {
     return { reply: `⚠️ 获取项目会话失败：${err instanceof Error ? err.message : String(err)}`, handled: true };
@@ -206,11 +223,11 @@ export async function handleSession(ctx: CommandContext, args: string): Promise<
       const selected = (status as { selectedProject?: { workspaceTitle?: string; path?: string; sessionId?: string } | null }).selectedProject;
       if (selected?.sessionId) {
         return {
-          reply: `当前绑定：${selected.workspaceTitle || ''} · ${selected.path || ''} · ${selected.sessionId.slice(-8)}\n解除绑定：/session off`,
+          reply: `当前会话：${selected.workspaceTitle || ''} · ${selected.path || ''} · ${selected.sessionId.slice(-8)}\n查看列表：/sessions · 清空上下文：/clear`,
           handled: true,
         };
       }
-      return { reply: '当前未绑定项目会话。\n查看列表：/sessionlist\n绑定：/session <序号或ID>', handled: true };
+      return { reply: '当前尚未开始会话。发送 /new 立即创建，或直接发消息。\n查看已有会话：/sessions', handled: true };
     } catch (err) {
       return { reply: `⚠️ 获取状态失败：${err instanceof Error ? err.message : String(err)}`, handled: true };
     }
@@ -242,23 +259,31 @@ export async function handleSession(ctx: CommandContext, args: string): Promise<
       return { reply: '没有可绑定的项目会话。', handled: true };
     }
 
-    let target: DshProjectSession | undefined;
-    if (/^\d+$/.test(arg)) {
-      target = projects[parseInt(arg, 10) - 1];
+    let matches: DshProjectSession[];
+    const exactId = projects.find((project) => project.sessionId === arg);
+    const shortIds = arg.length >= 4 ? projects.filter((p) => p.sessionId.startsWith(arg) || p.sessionId.endsWith(arg)) : [];
+    if (exactId) {
+      matches = [exactId];
+    } else if (/^\d+$/.test(arg) && !shortIds.length) {
+      if (!ctx.session.sessionChoices) {
+        return { reply: '请先发送 /sessions 查看列表，再使用序号切换。', handled: true };
+      }
+      const id = ctx.session.sessionChoices[Number(arg) - 1];
+      matches = projects.filter((project) => project.sessionId === id);
     } else {
-      target = projects.find((p) =>
-        p.sessionId === arg
-        || p.sessionId.endsWith(arg)
-        || p.workspaceTitle === arg
-        || p.path.includes(arg),
-      );
+      const names = projects.filter((p) => p.workspaceTitle === arg || p.path === arg);
+      matches = shortIds.length ? shortIds : names.length ? names : projects.filter((p) => p.path.includes(arg));
     }
-
+    if (matches.length > 1) {
+      return { reply: `匹配到多个会话：${arg}。请用 /sessions 查看后选择序号或完整 ID。`, handled: true };
+    }
+    const target = matches[0];
     if (!target) {
-      return { reply: `未找到匹配的项目会话：${arg}\n查看列表：/sessionlist`, handled: true };
+      return { reply: `未找到匹配会话（或列表已过期）：${arg}\n请用 /sessions 刷新列表。`, handled: true };
     }
 
     const result = await ctx.selectProject(target.sessionId);
+    if (result.ok === false) throw new Error(String(result.error || '切换被拒绝'));
     return {
       reply: `✅ 已绑定项目会话：${target.workspaceTitle} · ${target.path}${result.daemon ? `\n${result.daemon}` : ''}`,
       handled: true,

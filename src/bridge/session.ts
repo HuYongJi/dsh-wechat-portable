@@ -23,6 +23,8 @@ export interface Session {
   state: SessionState;
   chatHistory: ChatMessage[];
   maxHistoryLength?: number;
+  /** IDs from the last displayed list: numeric selection must not drift as sessions change. */
+  sessionChoices?: string[];
 }
 
 const DEFAULT_MAX_HISTORY = 100;

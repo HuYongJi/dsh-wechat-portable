@@ -1,6 +1,7 @@
 import type { Session } from '../session.js';
 import type { DshProjectSession } from '../dsh-client.js';
 import { logger } from '../logger.js';
+import { parseCommand } from './parser.js';
 import { handleHelp, handleClear, handleNew, handleCwd, handleModel, handleStatus, handleHistory, handleReset, handleUndo, handleVersion, handlePrompt, handleSend, handleSession, handleSessionList, handleTrust, handleDistrust, handleTrustList, handleTrustMode, handleUnknown } from './handlers.js';
 import type { TrustFile, TrustMode } from '../trust.js';
 
@@ -12,7 +13,9 @@ export interface CommandContext {
   ownerUserId?: string;
   session: Session;
   updateSession: (partial: Partial<Session>) => void;
-  clearSession: () => Session;
+  createSession: () => Promise<Record<string, unknown>>;
+  clearContext: (reset?: boolean) => Promise<void>;
+  stopTask: () => Promise<void>;
   getChatHistoryText?: (limit?: number) => string;
   text: string;
   listProjects?: () => Promise<DshProjectSession[]>;
@@ -32,6 +35,8 @@ export interface CommandResult {
   handled: boolean;
   dshPrompt?: string;
   sendFile?: string; // Absolute path to a file to send to the user
+  /** Commit the numbering only after the complete list was delivered. */
+  sessionChoices?: string[];
   /** 命令期望的 trustMode 变更（main 负责写入 trust.json——信任集唯一真相源）。 */
   setTrustMode?: TrustMode;
 }
@@ -47,17 +52,14 @@ export interface CommandResult {
  *   /history  - Show recent conversation history
  */
 export async function routeCommand(ctx: CommandContext): Promise<CommandResult> {
-  const text = ctx.text.trim();
+  const command = parseCommand(ctx.text);
+  if (!command) return { handled: false };
+  const { name: cmd, args } = command;
 
-  if (!text.startsWith('/')) {
-    return { handled: false };
+  logger.info('Conversation command received', { command: cmd, argumentLength: args.length });
+  if (['new', 'clear', 'reset', 'stop'].includes(cmd) && args) {
+    return { handled: true, reply: `用法：/${cmd}（不带参数）` };
   }
-
-  const spaceIdx = text.indexOf(' ');
-  const cmd = (spaceIdx === -1 ? text.slice(1) : text.slice(1, spaceIdx)).toLowerCase();
-  const args = spaceIdx === -1 ? '' : text.slice(spaceIdx + 1).trim();
-
-  logger.info('Slash command received', { command: cmd, argumentLength: args.length });
   if (['trust', 'distrust', 'untrust', 'trustmode'].includes(cmd)) {
     return { handled: true, reply: '此便携预览版仅供扫码绑定者本人使用，不支持添加其他用户。' };
   }
@@ -65,6 +67,13 @@ export async function routeCommand(ctx: CommandContext): Promise<CommandResult> 
   switch (cmd) {
     case 'help':
       return handleHelp(args);
+    case 'stop':
+      try {
+        await ctx.stopTask();
+        return { handled: true, reply: '⏹ 已停止当前任务，排队中的消息已清空。' };
+      } catch {
+        return { handled: true, reply: '⚠️ 停止失败，请检查电脑端任务状态。' };
+      }
     case 'clear':
       return handleClear(ctx);
     case 'new':
@@ -89,6 +98,9 @@ export async function routeCommand(ctx: CommandContext): Promise<CommandResult> 
     case 'sessions':
     case 'projects':
       return handleSessionList(ctx);
+    case 'switch':
+      if (!args) return { handled: true, reply: '用法：/switch <序号、ID或唯一项目名>\n先用 /sessions 查看列表。' };
+      return handleSession(ctx, args);
     case 'session':
       return handleSession(ctx, args);
     case 'trust':

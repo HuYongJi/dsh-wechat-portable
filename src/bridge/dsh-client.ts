@@ -41,6 +41,7 @@ export interface DshProjectSession {
   cwd?: string;
   createdAt: string;
   live: boolean;
+  current?: boolean;
 }
 
 export class DshClient {
@@ -82,22 +83,28 @@ export class DshClient {
     return res.json() as Promise<{ accepted: boolean; messageId?: string }>;
   }
 
-  async stop(sessionId: string): Promise<void> {
-    await fetch(`${this.baseUrl}/api/stop`, {
-      method: 'POST',
-      headers: this.headers(),
-      body: JSON.stringify({ sessionId }),
-      signal: AbortSignal.timeout(10_000),
+  private async control(path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const res = await fetch(`${this.baseUrl}${path}`, {
+      method: 'POST', headers: this.headers(), body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000),
     });
+    const data = await res.json() as Record<string, unknown>;
+    if (!res.ok || data.ok !== true) {
+      throw new Error(typeof data.error === 'string' ? data.error : `control HTTP ${res.status}`);
+    }
+    return data;
   }
 
-  async clear(sessionId: string): Promise<void> {
-    await fetch(`${this.baseUrl}/api/clear`, {
-      method: 'POST',
-      headers: this.headers(),
-      body: JSON.stringify({ sessionId }),
-      signal: AbortSignal.timeout(10_000),
-    });
+  async stop(sessionId: string): Promise<void> {
+    await this.control('/api/stop', { sessionId });
+  }
+
+  async clear(sessionId: string, reset = false): Promise<void> {
+    await this.control('/api/clear', { sessionId, reset });
+  }
+
+  async newSession(sessionId: string): Promise<Record<string, unknown>> {
+    return this.control('/api/sessions/new', { sessionId });
   }
 
   /**
@@ -134,31 +141,11 @@ export class DshClient {
   }
 
   async selectProject(sessionId: string): Promise<Record<string, unknown>> {
-    const res = await fetch(`${this.baseUrl}/api/projects/select`, {
-      method: 'POST',
-      headers: this.headers(),
-      body: JSON.stringify({ sessionId }),
-      signal: AbortSignal.timeout(15_000),
-    });
-    const data = await res.json().catch(() => ({})) as Record<string, unknown>;
-    if (!res.ok || data.ok === false) {
-      throw new Error((data.error as string) || (data.message as string) || `select HTTP ${res.status}`);
-    }
-    return data;
+    return this.control('/api/projects/select', { sessionId });
   }
 
   async detachProject(): Promise<Record<string, unknown>> {
-    const res = await fetch(`${this.baseUrl}/api/projects/detach`, {
-      method: 'POST',
-      headers: this.headers(),
-      body: JSON.stringify({}),
-      signal: AbortSignal.timeout(15_000),
-    });
-    const data = await res.json().catch(() => ({})) as Record<string, unknown>;
-    if (!res.ok || data.ok === false) {
-      throw new Error((data.error as string) || (data.message as string) || `detach HTTP ${res.status}`);
-    }
-    return data;
+    return this.control('/api/projects/detach', {});
   }
 
   /**

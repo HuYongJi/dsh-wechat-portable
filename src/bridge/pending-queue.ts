@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { DATA_DIR } from './constants.js';
 import { logger } from './logger.js';
+import { splitWechatText } from './wechat/text.js';
 
 export interface PendingItem {
   text: string;
@@ -64,4 +65,47 @@ export function clearPending(accountId: string): void {
 
 export function hasPending(accountId: string): boolean {
   return loadPendingQueue(accountId).length > 0;
+}
+
+/** Single daemon writer; queue entries are ready-to-send text, never Markdown input. */
+export function createPendingQueueDrainer(
+  accountId: string,
+  ownerUserId: string,
+  send: (target: string, text: string) => Promise<void>,
+): () => Promise<void> {
+  let active = false;
+  return async () => {
+    if (active) return;
+    active = true;
+    try {
+      const items = loadPendingQueue(accountId);
+      if (items.length === 0) return;
+      const remaining: PendingItem[] = [];
+      for (const item of items) {
+        if (item.role !== 'final') continue;
+        const target = item.userId || ownerUserId;
+        if (!ownerUserId || target !== ownerUserId) continue;
+        // Legacy entries also remain verbatim: guessing whether text was already
+        // formatted could silently strip Markdown-looking literal code.
+        const chunks = splitWechatText(item.text);
+        let index = 0;
+        try {
+          for (; index < chunks.length; index++) await send(target, chunks[index]);
+          logger.info('Pending queue item delivered', { accountId, target });
+        } catch (err) {
+          logger.warn('Pending queue delivery failed, keep for retry', {
+            accountId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          remaining.push({ ...item, text: chunks.slice(index).join('') });
+        }
+      }
+      // Preserve new replies appended while awaiting network sends; the active
+      // guard prevents another timer from draining/rewriting the same snapshot.
+      const appended = loadPendingQueue(accountId).slice(items.length);
+      savePendingQueue(accountId, [...remaining, ...appended]);
+    } finally {
+      active = false;
+    }
+  };
 }

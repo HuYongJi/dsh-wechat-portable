@@ -3,7 +3,8 @@ import { createServer } from 'node:http';
 import { createInterface } from 'node:readline';
 import process from 'node:process';
 import { spawnSync } from 'node:child_process';
-import { join, basename, extname } from 'node:path';
+import { join, basename, extname, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { unlinkSync, writeFileSync, readFileSync, mkdirSync, existsSync, chmodSync } from 'node:fs';
 import { homedir } from 'node:os';
 
@@ -12,9 +13,13 @@ import { saveAccount, loadLatestAccount, type AccountData } from './wechat/accou
 import { startQrLogin, waitForQrScan } from './wechat/login.js';
 import { createMonitor, type MonitorCallbacks } from './wechat/monitor.js';
 import { createSender } from './wechat/send.js';
+import { formatWechatText } from './wechat/format.js';
+import { splitWechatText, takeWechatBatch } from './wechat/text.js';
 import { downloadImage, extractText, extractFirstImageUrl, extractFirstFileItem, extractFirstVideoItem, downloadFile, downloadVideo } from './wechat/media.js';
 import { createSessionStore, type Session } from './session.js';
 import { routeCommand, type CommandContext, type CommandResult } from './commands/router.js';
+import { parseCommand, interruptsTurn } from './commands/parser.js';
+import { createMessageQueue } from './message-queue.js';
 import { loadConfig, saveConfig, type CalmConfig } from './config.js';
 import { loadJson, saveJson } from './store.js';
 import { logger } from './logger.js';
@@ -22,7 +27,7 @@ import { DATA_DIR } from './constants.js';
 import { validateOutboundFile } from './safe-files.js';
 import { ensurePrivateDir } from '../portable/paths.js';
 import { MessageType, type WeixinMessage } from './wechat/types.js';
-import { loadPendingQueue, savePendingQueue, appendPending, type PendingItem } from './pending-queue.js';
+import { loadPendingQueue, appendPending, createPendingQueueDrainer } from './pending-queue.js';
 import { DshClient, type DshStreamEvent } from './dsh-client.js';
 import { createNotifyThrottle } from './notify.js';
 import { loadTrust, saveTrust, decideTrust, setTrustMode } from './trust.js';
@@ -30,8 +35,6 @@ import { loadTrust, saveTrust, decideTrust, setTrustMode } from './trust.js';
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-const MAX_MESSAGE_LENGTH = 4000;
 
 /**
  * 防休眠抑制器（config.preventSleep=true 时由 runDaemon 启停）：
@@ -273,86 +276,6 @@ const SILENCE_MESSAGES = [
   '还在跑呢，任务量比较大，不过马上就能出结果了',
   '正在处理中，进展顺利，再等一会儿就好',
 ];
-
-/** Split text into blocks at paragraph boundaries (double newlines). */
-function parseBlocks(text: string): string[] {
-  return text.split(/\n\n+/).filter(block => block.length > 0);
-}
-
-/** Find a safe split point that won't break markdown formatting. */
-function findSafeSplitPoint(text: string, maxLen: number): number {
-  let idx = text.lastIndexOf('\n', maxLen);
-  if (idx >= maxLen * 0.3) return idx;
-
-  const sentenceEnd = /[。！？.!?]$/;
-  for (let i = maxLen; i >= maxLen * 0.5; i--) {
-    if (sentenceEnd.test(text.slice(i - 1, i))) return i;
-  }
-
-  idx = text.lastIndexOf(' ', maxLen);
-  if (idx >= maxLen * 0.3) return idx;
-
-  return maxLen;
-}
-
-/** Fallback: split a single oversized block at safe boundaries. */
-function splitByNewline(text: string, maxLen: number): string[] {
-  const chunks: string[] = [];
-  let remaining = text;
-  while (remaining.length > 0) {
-    if (remaining.length <= maxLen) {
-      chunks.push(remaining);
-      break;
-    }
-    const splitIdx = findSafeSplitPoint(remaining, maxLen);
-    chunks.push(remaining.slice(0, splitIdx));
-    remaining = remaining.slice(splitIdx).replace(/^\n+/, '');
-  }
-  return chunks;
-}
-
-/** Split a message into WeChat-safe chunks, preserving paragraphs. */
-/**
- * 从流式缓冲头部切出一段待发文本：优先在换行边界截断（≤ maxChars，不切词）；
- * 找不到合适边界时按 maxChars 硬切（罕见，长串无换行文本）。返回 [切出部分, 剩余]。
- */
-function takeBatch(buffer: string, maxChars: number): [string, string] {
-  if (buffer.length <= maxChars) return [buffer, ''];
-  const windowText = buffer.slice(0, maxChars);
-  const cut = windowText.lastIndexOf('\n');
-  // 边界太靠前（不足一半）就放弃边界硬切，避免切出过短碎片。
-  if (cut >= maxChars / 2) return [windowText.slice(0, cut), buffer.slice(cut + 1)];
-  return [windowText, buffer.slice(maxChars)];
-}
-
-function splitMessage(text: string, maxLen: number = MAX_MESSAGE_LENGTH): string[] {
-  if (text.length <= maxLen) return [text];
-  const blocks = parseBlocks(text);
-  const chunks: string[] = [];
-  let current = '';
-
-  for (const block of blocks) {
-    if (current.length === 0) {
-      if (block.length <= maxLen) {
-        current = block;
-      } else {
-        chunks.push(...splitByNewline(block, maxLen));
-      }
-    } else if (current.length + 2 + block.length <= maxLen) {
-      current += '\n\n' + block;
-    } else {
-      chunks.push(current);
-      if (block.length <= maxLen) {
-        current = block;
-      } else {
-        chunks.push(...splitByNewline(block, maxLen));
-        current = '';
-      }
-    }
-  }
-  if (current) chunks.push(current);
-  return chunks;
-}
 
 function promptUser(question: string, defaultValue?: string): Promise<string> {
   return new Promise((resolve) => {
@@ -604,34 +527,20 @@ async function runDaemon(): Promise<void> {
   // P1-2 / M3：per-user 消息队列——A 的长任务不再阻塞 B。
   // 每个用户一条队列串行消费；用户之间并行（host 侧本来就是独立 agent）。
   // -------------------------------------------------------------------------
-  const messageQueues = new Map<string, WeixinMessage[]>();
-  const drainingUsers = new Set<string>();
+  const messageQueues = new Map<string, ReturnType<typeof createMessageQueue<WeixinMessage>>>();
 
   function enqueueMessage(msg: WeixinMessage): void {
     const uid = msg.from_user_id!;
-    let q = messageQueues.get(uid);
-    if (!q) {
-      q = [];
-      messageQueues.set(uid, q);
+    let queue = messageQueues.get(uid);
+    if (!queue) {
+      queue = createMessageQueue<WeixinMessage>(
+        (message, signal) => handleMessage(message, account, sessionStore, sender, config, client, signal),
+        (error) => { logger.error('Message processing failed', { error: error instanceof Error ? error.message : String(error) }); },
+      );
+      messageQueues.set(uid, queue);
     }
-    q.push(msg);
-    void drainUserQueue(uid);
-  }
-
-  async function drainUserQueue(userId: string): Promise<void> {
-    if (drainingUsers.has(userId)) return;
-    drainingUsers.add(userId);
-    try {
-      const q = messageQueues.get(userId);
-      while (q && q.length > 0) {
-        const msg = q.shift()!;
-        await handleMessage(msg, account!, sessionStore, sender, config, client, q);
-      }
-    } catch (err) {
-      logger.error('drainUserQueue failed', { userId, error: err instanceof Error ? err.message : String(err) });
-    } finally {
-      drainingUsers.delete(userId);
-    }
+    const command = parseCommand(extractTextFromItems(msg.item_list || []));
+    queue.enqueue(msg, interruptsTurn(command));
   }
 
   /**
@@ -669,46 +578,6 @@ async function runDaemon(): Promise<void> {
       notifyThrottle.enqueue(hint, account.userId);
     }
     return decision.reason;
-  }
-
-  function handlePriorityCommand(msg: WeixinMessage): boolean {
-    if (msg.message_type !== MessageType.USER || !msg.item_list) return false;
-    // 破坏性命令（取消进行中任务 / 清空会话）：发送者必须先过信任门禁
-    // （onMessage 已检），且只作用于自己的会话。
-    // owner-only 模式下与原行为一致：仅 owner 本人。
-    const ownerId = account?.userId;
-    const trustFile = loadTrust();
-    if (trustFile.mode === 'owner-only') {
-      if (!ownerId || msg.from_user_id !== ownerId) return false;
-    } else if (!msg.from_user_id) {
-      return false;
-    }
-    const text = extractTextFromItems(msg.item_list);
-    if (!/^\/(?:stop|clear|new)(?:\s|$)/i.test(text)) return false;
-    const userId = msg.from_user_id!;
-    const sessionKey = sessionStore.keyFor(userId);
-    const userSession = sessionStore.load(userId);
-    if (userSession.state !== 'processing') return false;
-
-    // 只清自己的排队消息，不影响其他用户。
-    const q = messageQueues.get(userId);
-    if (q) q.length = 0;
-    if (/^\/(?:clear|new)(?:\s|$)/i.test(text)) {
-      const cleared = sessionStore.clear(userId, userSession);
-      Object.assign(userSession, cleared);
-    } else {
-      userSession.state = 'idle';
-      sessionStore.save(userId, userSession);
-    }
-
-    if (text.trim().toLowerCase().startsWith('/stop')) {
-      client.stop(sessionKey).catch(() => {});
-      sender.sendText(userId, msg.context_token ?? '', '⏹ 已停止当前对话，排队中的消息已清空。').catch(() => {});
-    } else {
-      client.clear(sessionKey).catch(() => {});
-      sender.sendText(userId, msg.context_token ?? '', '✅ 会话已清除。').catch(() => {});
-    }
-    return true;
   }
 
   /**
@@ -784,7 +653,6 @@ async function runDaemon(): Promise<void> {
         }
       }
 
-      if (handlePriorityCommand(msg)) return;
       if (await handleApprovalReply(msg)) return;
       if (msg.message_type === MessageType.USER && msg.from_user_id) {
         enqueueMessage(msg);
@@ -806,27 +674,8 @@ async function runDaemon(): Promise<void> {
 
   // 发送失败暂存重试（pending-queue）：daemon 启动即补发一次 + 每 5 分钟重试，
   // 直到发完。补偿"发送失败在 daemon 退出后丢失"的崩溃窗口。
-  async function flushPendingQueue(): Promise<void> {
-    const items = loadPendingQueue(account.accountId);
-    if (items.length === 0) return;
-    const remaining: PendingItem[] = [];
-    for (const item of items) {
-      if (item.role !== 'final') continue;
-      try {
-        const target = item.userId || account.userId || '';
-        if (!account.userId || target !== account.userId) continue;
-        await sender.sendText(target, contextTokenFor(target), item.text);
-        logger.info('Pending queue item delivered', { accountId: account.accountId, target });
-      } catch (err) {
-        logger.warn('Pending queue delivery failed, keep for retry', {
-          accountId: account.accountId,
-          error: err instanceof Error ? err.message : String(err),
-        });
-        remaining.push(item);
-      }
-    }
-    savePendingQueue(account.accountId, remaining);
-  }
+  const flushPendingQueue = createPendingQueueDrainer(account.accountId, account.userId || '',
+    (target, text) => sender.sendText(target, contextTokenFor(target), text));
   const pendingRetryTimer = setInterval(() => { void flushPendingQueue().catch(() => {}); }, 5 * 60 * 1000);
   pendingRetryTimer.unref?.();
   void flushPendingQueue().catch(() => {});
@@ -861,17 +710,18 @@ async function runDaemon(): Promise<void> {
 // Message handling
 // ---------------------------------------------------------------------------
 
-async function handleMessage(
+export async function handleMessage(
   msg: WeixinMessage,
   account: AccountData,
   sessionStore: ReturnType<typeof createSessionStore>,
   sender: ReturnType<typeof createSender>,
   config: ReturnType<typeof loadConfig>,
   client: DshClient,
-  messageQueue: WeixinMessage[],
+  signal: AbortSignal,
 ): Promise<void> {
   if (msg.message_type !== MessageType.USER) return;
   if (!msg.from_user_id || !msg.item_list) return;
+  if (!account.userId || msg.from_user_id !== account.userId) return;
 
   // 门禁判定（拒绝/放行）已在 onMessage 统一执行（含优先命令与审批回复），
   // 这里重读 trust.json 只是为了给命令上下文提供当前信任状态（trustCtx），不是重复判定。
@@ -888,14 +738,8 @@ async function handleMessage(
   const fileItem = extractFirstFileItem(msg.item_list);
   const videoItem = extractFirstVideoItem(msg.item_list);
 
-  // While the current turn is running, keep ordinary messages queued and
-  // process them after this turn finishes, instead of dropping them.
-  if (session.state === 'processing' && !userText.startsWith('/')) {
-    messageQueue.push(msg);
-    return;
-  }
-
-  if (userText.startsWith('/')) {
+  if (signal.aborted) return;
+  if (parseCommand(userText)) {
     const updateSession = (partial: Partial<Session>) => {
       Object.assign(session, partial);
       sessionStore.save(fromUserId, session);
@@ -921,7 +765,9 @@ async function handleMessage(
       ownerUserId: account.userId,
       session,
       updateSession,
-      clearSession: () => sessionStore.clear(fromUserId),
+      createSession: () => client.newSession(sessionStore.keyFor(fromUserId)),
+      clearContext: (reset) => client.clear(sessionStore.keyFor(fromUserId), reset),
+      stopTask: () => client.stop(sessionStore.keyFor(fromUserId)),
       getChatHistoryText: (limit?: number) => sessionStore.getChatHistoryText(session, limit),
       text: userText,
       listProjects: () => client.listProjects(),
@@ -940,17 +786,10 @@ async function handleMessage(
     }
 
     if (result.handled && result.reply) {
-      await sender.sendText(fromUserId, contextToken, result.reply);
-      // /clear and /new must also clear the real DSH session (and its persisted
-      // id mapping), even when the daemon is idle and not just mid-turn.
-      if (/^\/(?:clear|new)(?:\s|$)/i.test(userText.trim())) {
-        const sessionKey = sessionStore.keyFor(fromUserId);
-        await client.clear(sessionKey).catch((err) => {
-          logger.warn('Failed to clear DSH session from slash command', {
-            error: err instanceof Error ? err.message : String(err),
-          });
-        });
+      for (const part of splitWechatText(result.reply)) {
+        await sender.sendText(fromUserId, contextToken, part);
       }
+      if (result.sessionChoices) updateSession({ sessionChoices: result.sessionChoices });
       return;
     }
 
@@ -961,7 +800,7 @@ async function handleMessage(
 
     if (result.handled && result.dshPrompt) {
       await sendToDsh(result.dshPrompt, imageItem, fileItem, videoItem, fromUserId, contextToken,
-        account, session, sessionStore, sender, config, client);
+        account, session, sessionStore, sender, config, client, signal);
       return;
     }
 
@@ -974,7 +813,7 @@ async function handleMessage(
   }
 
   await sendToDsh(userText, imageItem, fileItem, videoItem, fromUserId, contextToken,
-    account, session, sessionStore, sender, config, client);
+    account, session, sessionStore, sender, config, client, signal);
 }
 
 async function sendToDsh(
@@ -990,6 +829,7 @@ async function sendToDsh(
   sender: ReturnType<typeof createSender>,
   config: ReturnType<typeof loadConfig>,
   client: DshClient,
+  signal: AbortSignal,
 ): Promise<void> {
   // P1-2 / M2：session key = botAccountId::userId —— 每个微信用户独立会话。
   // owner 也走同一套路径（与迁移后的数据一致）。
@@ -1000,6 +840,12 @@ async function sendToDsh(
 
   sessionStore.addChatMessage(session, 'user', userText || '(图片/视频/文件)');
   const stopTyping = sender.startTyping(fromUserId, contextToken);
+  let stopping: Promise<void> | undefined;
+  const requestStop = () => {
+    stopping ??= client.stop(sessionKey);
+    // Observe rejection immediately; the finalizer still awaits the same result.
+    void stopping.catch(() => {});
+  };
 
   try {
     // Download media to local paths; DSH can read them from disk.
@@ -1039,6 +885,9 @@ async function sendToDsh(
       }
     }
 
+    signal.throwIfAborted();
+    // Let prompt acceptance settle before cancellation cleanup, so a late request
+    // cannot recreate the old task after /stop or a conversation switch.
     const accepted = await client.prompt({
       text: prompt,
       sessionId: sessionKey,
@@ -1048,6 +897,11 @@ async function sendToDsh(
       files,
     });
 
+    // Cancel the Host immediately, even if a WeChat send is waiting on rate limits.
+    // Only arm after prompt acceptance so cancellation cannot race ahead of it.
+    signal.addEventListener('abort', requestStop, { once: true });
+    if (signal.aborted) requestStop();
+    signal.throwIfAborted();
     if (!accepted.accepted) {
       await sender.sendText(fromUserId, contextToken, '消息已收到，但 DSH 未接受处理请求。');
       session.state = 'idle';
@@ -1059,7 +913,9 @@ async function sendToDsh(
     let finalText = '';
     let flushTimer: ReturnType<typeof setInterval> | undefined;
     let keepaliveTimer: ReturnType<typeof setInterval> | undefined;
+    // Outbound view only. finalText and the Host's original events stay Markdown.
     let pendingSend = '';
+    let hasDisplayMessage = false;
     let lastSentTime = Date.now();
     let turnUsage: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number } | undefined;
 
@@ -1076,23 +932,28 @@ async function sendToDsh(
     let flushChain = Promise.resolve();
     const flush = (maxChars?: number): Promise<void> => {
       flushChain = flushChain.then(async () => {
+      if (signal.aborted) { pendingSend = ''; return; }
       if (!pendingSend) return;
       let text: string;
       if (maxChars !== undefined) {
-        [text, pendingSend] = takeBatch(pendingSend, maxChars);
+        [text, pendingSend] = takeWechatBatch(pendingSend, maxChars);
       } else {
         text = pendingSend;
         pendingSend = '';
       }
-      for (const chunk of splitMessage(text)) {
+      const chunks = splitWechatText(text);
+      for (let index = 0; index < chunks.length; index++) {
+        if (signal.aborted) return;
         try {
-          await sender.sendText(fromUserId, contextToken, chunk);
+          await sender.sendText(fromUserId, contextToken, chunks[index]);
           lastSentTime = Date.now();
         } catch (err) {
           logger.warn('Flush send failed, will retry on next flush', {
             error: err instanceof Error ? err.message : String(err),
           });
-          pendingSend = text + (pendingSend ? '\n\n' + pendingSend : '');
+          // Keep the already rendered suffix verbatim. Never resend acknowledged
+          // chunks or interpret literal code as Markdown on a retry.
+          pendingSend = chunks.slice(index).join('') + pendingSend;
           return;
         }
       }
@@ -1124,6 +985,7 @@ async function sendToDsh(
       return calmCfgCache!;
     };
     keepaliveTimer = setInterval(() => {
+      if (signal.aborted) return;
       const calm = currentCalmConfig();
       if (calm.enabled === false) return;
       if (calm.maxCount && calmSentCount >= calm.maxCount) return;
@@ -1139,14 +1001,23 @@ async function sendToDsh(
       }
     }, 2000);
 
-    const controller = new AbortController();
     try {
     await client.stream(sessionKey, (event: DshStreamEvent) => {
+      if (signal.aborted) return;
       switch (event.type) {
         case 'chunk':
           if (event.text) {
             finalText += event.text;
-            pendingSend += event.text;
+            // Host chunks are complete committed assistant/message texts, not
+            // token deltas. Render before any 1200/4000-character split so fences,
+            // links and table headers are never parsed in disconnected fragments.
+            const displayText = formatWechatText(event.text);
+            if (displayText) {
+              // A previous message may be in-flight rather than in pendingSend.
+              // Its boundary must survive a failed send followed by a retry.
+              pendingSend += (hasDisplayMessage ? '\n\n' : '') + displayText;
+              hasDisplayMessage = true;
+            }
             lastChunkTime = Date.now();
             // 缓冲攒大后按自然边界切出一段先发（不切词），剩余的继续攒。
             if (pendingSend.length >= 1200) {
@@ -1174,17 +1045,20 @@ async function sendToDsh(
           }
           break;
       }
-    }, controller.signal);
+    }, signal);
 
     } catch {
-      const warning = '\n\n⚠️ 回复连接中断或超过 30 分钟。请检查电脑端状态；任务仍在运行时可发送 /stop。';
-      finalText += warning;
-      pendingSend += warning;
+      if (!signal.aborted) {
+        const warning = '\n\n⚠️ 回复连接中断或超过 30 分钟。请检查电脑端状态；任务仍在运行时可发送 /stop。';
+        finalText += warning;
+        pendingSend += warning;
+      }
     } finally {
       if (flushTimer) clearInterval(flushTimer);
       if (keepaliveTimer) clearInterval(keepaliveTimer);
-      controller.abort();
+      await flushChain;
     }
+    if (signal.aborted) return;
 
     // 上下文用量尾注：inputTokens + cacheReadTokens ≈ 当前上下文大小。
     // 并入最后一段缓冲一起发，不额外产生消息（config.json 可关：usageFooter=false）。
@@ -1197,6 +1071,7 @@ async function sendToDsh(
     }
 
     await flush();
+    if (signal.aborted) return;
 
     // 崩溃安全：整轮结束仍未发出的缓冲落 pending-queue（daemon 重启/定时补发），
     // 否则发送失败在 daemon 退出后永久丢失（用户收不到完整回复）。
@@ -1224,13 +1099,22 @@ async function sendToDsh(
       await sender.sendText(fromUserId, contextToken, 'DSH 无返回内容。');
     }
   } catch (err) {
-    const errorMsg = err instanceof Error ? err.message : String(err);
-    logger.error('Error in sendToDsh', { error: errorMsg });
-    await sender.sendText(fromUserId, contextToken, '处理消息时出错，请稍后重试。');
+    if (!signal.aborted) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      logger.error('Error in sendToDsh', { error: errorMsg });
+      await sender.sendText(fromUserId, contextToken, '处理消息时出错，请稍后重试。');
+    }
   } finally {
-    session.state = 'idle';
-    sessionStore.save(fromUserId, session);
-    stopTyping();
+    try {
+      // The queue does not run a control command until the old turn has stopped
+      // and finished its final local write. No stale finally can restore history.
+      if (signal.aborted) { requestStop(); await stopping; }
+    } finally {
+      signal.removeEventListener('abort', requestStop);
+      session.state = 'idle';
+      sessionStore.save(fromUserId, session);
+      stopTyping();
+    }
   }
 }
 
@@ -1238,18 +1122,13 @@ async function sendToDsh(
 // CLI
 // ---------------------------------------------------------------------------
 
-const command = process.argv[2];
-
-if (command === 'setup') {
-  runSetup().catch((err) => {
-    logger.error('Setup failed', { error: err instanceof Error ? err.message : String(err) });
-    console.error('设置失败:', err);
-    process.exit(1);
-  });
-} else {
-  runDaemon().catch((err) => {
-    logger.error('Daemon start failed', { error: err instanceof Error ? err.message : String(err) });
-    console.error('启动失败:', err);
+// Importing the message processor for isolated tests must not start the daemon.
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  const command = process.argv[2];
+  const run = command === 'setup' ? runSetup : runDaemon;
+  run().catch((err) => {
+    logger.error('Bridge command failed', { error: err instanceof Error ? err.message : String(err) });
+    console.error(command === 'setup' ? '设置失败:' : '启动失败:', err);
     process.exit(1);
   });
 }

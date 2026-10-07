@@ -26,6 +26,8 @@ import type { AgentHandle } from '@deepseek-ai/dsh-agent'
 import { createApprovalManager } from './approval.js'
 import { createWechatAgentSetup } from './agent-setup.js'
 import { registerNativeControl } from './host/control.js'
+import { createConversationManager } from './host/conversations.js'
+import type { Session as BridgeSession } from './bridge/session.js'
 import { ControlError, parseControlValue, type ControlSetupStatus } from './host/contract.js'
 import { resolveDataDir, defaultWorkingDirectory, ensurePrivateDir, atomicJson, requireWorkspace } from './portable/paths.js'
 import { HttpBoundaryError, requireLoopbackHost, isLoopbackAddress, assertPanelRequest, readJsonBody, ownerSessionKey, isOwnerSessionKey, PromptReplay, assistantTextDelta, deferHostTask } from './host-compat.js'
@@ -241,7 +243,7 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   function persistSelectedSessionId(accountId: string, dshSessionId: string): void {
-    validateAccountId(accountId)
+    assertOwnerKey(accountId)
     const map = loadSelectedSessionIds()
     map[accountId] = dshSessionId
     saveSelectedSessionIds(map)
@@ -256,6 +258,11 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   const selectedSessionIds = new Map<string, string>(Object.entries(loadSelectedSessionIds()))
+
+  function currentSessionId(key: string): string | undefined {
+    return selectedSessionIds.get(key) ?? selectedSessionIds.get(botPrefixOf(key))
+      ?? sessionIds.get(key) ?? loadSessionIdMap()[key]
+  }
 
   function newDshSessionId(key: string): string {
     // 多用户 key 形如 ${botAccountId}::${userId}，而账号/用户 id 本身自带 '@' 与 '.'。
@@ -422,8 +429,13 @@ export function apply(ctx: Context, config: Config): void {
       agents.delete(accountId)
       removePersistedSessionId(accountId)
       if (!options?.preserveSelection) {
-        selectedSessionIds.delete(accountId)
-        removeSelectedSessionId(accountId)
+        // Remove the legacy bot-level fallback as well, even with no live agent.
+        for (const key of new Set([accountId, botPrefixOf(accountId)])) {
+          selectedSessionIds.delete(key)
+          removeSelectedSessionId(key)
+          removePersistedSessionId(key)
+        }
+        pendingProjectSwitches.delete(accountId)
       }
       if (handle) await handle.dispose()
       closeStreams(accountId)
@@ -543,7 +555,7 @@ export function apply(ctx: Context, config: Config): void {
   async function selectedProjectPayload(accountId?: string): Promise<Record<string, unknown> | null> {
     const target = ownerControlKey(accountId)
     if (!target) return null
-    const selectedId = selectedSessionIds.get(target)
+    const selectedId = currentSessionId(target)
     if (!selectedId) return null
     const items = await listProjectSessions()
     const item = items.find((candidate) => candidate.sessionId === selectedId)
@@ -626,61 +638,56 @@ export function apply(ctx: Context, config: Config): void {
     writeBridgeAccountSession(key, session)
   }
 
-  async function selectProjectSession(dshSessionId: string, accountId?: string): Promise<Record<string, unknown>> {
-    const target = ownerControlKey(accountId)
-    if (!target) return { ok: false, error: '没有已绑定的微信账号，请先扫码绑定。' }
-    const items = await listProjectSessions()
-    const item = items.find((candidate) => candidate.sessionId === dshSessionId)
-    if (!item) return { ok: false, error: '指定的会话不存在或不属于任何项目。' }
-
-    // If the user is re-selecting the conversation the bridge already owns,
-    // treat it as a no-op instead of disposing the live agent.
-    const currentDshSessionId = sessionIds.get(target)
-    if (dshSessionId === currentDshSessionId) {
-      return {
-        ok: true,
-        accountId: target,
-        selectedSessionId: dshSessionId,
-        project: item,
-        daemon: '已经绑定到该项目会话。',
+  const conversations = createConversationManager({
+    assertOwner: assertOwnerKey,
+    current: currentSessionId,
+    list: listProjectSessions,
+    isLive: (id) => !!ctx.get('sessions')?.get(SessionId(id)),
+    dispose: disposeAgent,
+    stop: async (key) => {
+      creationControllers.get(key)?.abort(new Error('WeChat stop requested'))
+      await creating.get(key)?.catch(() => undefined)
+      const handle = agents.get(key)
+      if (handle) {
+        handle.agent.cancel({ kind: 'user' })
+        await handle.agent.whenIdle()
       }
+      pendingPrompts.delete(key)
+    },
+    bind: (key, id) => {
+      persistSelectedSessionId(key, id)
+      selectedSessionIds.set(key, id)
+    },
+    create: async (key, input) => String((await ensureAgent(key, input)).agent.session.id),
+    validateNew: (input) => {
+      const selection = ctx.agentDefaultModel.currentSelection()
+      if (!(config.provider || selection?.provider) || !(input.model || config.model || selection?.model)) {
+        throw new Error('请先在 DSH 中选择模型。')
+      }
+      input.cwd = requireWorkspace(resolve(input.cwd.replace(/^~(?=$|[\\/])/, homedir())))
+    },
+    readLocal: (key) => ({
+      workingDirectory: readBridgeConfig().workingDirectory, state: 'idle', chatHistory: [],
+      ...readBridgeAccountSession(key),
+    }) as BridgeSession,
+    writeLocal: (key, session) => writeBridgeAccountSession(key, { ...session }),
+    defaultDirectory: () => readBridgeConfig().workingDirectory,
+  })
+
+  async function selectProjectSession(dshSessionId: string, accountId?: string, restart = true): Promise<Record<string, unknown>> {
+    const target = ownerControlKey(accountId)
+    const result = await conversations.select(target, dshSessionId)
+    if (restart && daemonRunning() && result.daemon !== '已经在该会话中。') {
+      return { ...result, accountId: target, daemon: (await restartDaemon()).message }
     }
-
-    // A live DSH session can only be owned by one agent loop. If the selected
-    // conversation is currently open in the DSH UI, refuse before touching the
-    // current bridge agent instead of silently falling back on the next message.
-    const sessionsService = ctx.get('sessions') as { get(id: unknown): unknown } | undefined
-    if (sessionsService?.get(SessionId(dshSessionId))) {
-      return { ok: false, error: '该会话当前正在 DSH 中打开，请先在 DSH 中关闭该会话后再绑定。' }
-    }
-
-    // Drop the current bridge-owned agent(s) so the next message resumes the
-    // selected project conversation instead of the previous bridge session.
-    // 多用户：账号级绑定影响该 bot 下所有 per-user agent。
-    await disposeKeysUnder(target)
-
-    selectedSessionIds.set(target, dshSessionId)
-    persistSelectedSessionId(target, dshSessionId)
-    resetBridgeAccountSession(target, item.path)
-
-    const daemonResult = daemonRunning() ? await restartDaemon() : { ok: true, message: '守护进程未运行，绑定将在下次启动时生效。' }
-    return {
-      ok: true,
-      accountId: target,
-      selectedSessionId: dshSessionId,
-      project: item,
-      daemon: daemonResult.message,
-    }
+    return { ...result, accountId: target }
   }
 
-  async function detachProjectSession(accountId?: string): Promise<Record<string, unknown>> {
+  async function detachProjectSession(accountId?: string, restart = true): Promise<Record<string, unknown>> {
     const target = ownerControlKey(accountId)
-    if (!target) return { ok: false, error: '没有已绑定的微信账号。' }
-    await disposeKeysUnder(target)
-    const config = readBridgeConfig()
-    resetBridgeAccountSession(target, config.workingDirectory)
-    const daemonResult = daemonRunning() ? await restartDaemon() : { ok: true, message: '守护进程未运行，解除绑定将在下次启动时生效。' }
-    return { ok: true, accountId: target, daemon: daemonResult.message }
+    const result = await conversations.detach(target)
+    if (restart && daemonRunning()) return { ...result, accountId: target, daemon: (await restartDaemon()).message }
+    return { ...result, accountId: target }
   }
 
   /** dispose 精确匹配 key 及其 `${key}::` 前缀下的全部 agent（账号级操作用于多用户）。 */
@@ -824,20 +831,20 @@ export function apply(ctx: Context, config: Config): void {
       }
 
       if (req.method === 'GET' && url.pathname === '/api/projects') {
-        sendJson(res, 200, { ok: true, items: await listProjectSessions() })
+        sendJson(res, 200, { ok: true, items: await conversations.list(ownerControlKey()) })
         return
       }
 
       if (req.method === 'POST' && url.pathname === '/api/projects/select') {
         const body = await readBody(req)
         const sessionId = String(body.sessionId || '')
-        const result = await selectProjectSession(sessionId)
+        const result = await selectProjectSession(sessionId, undefined, false)
         sendJson(res, result.ok ? 200 : 400, result)
         return
       }
 
       if (req.method === 'POST' && url.pathname === '/api/projects/detach') {
-        const result = await detachProjectSession()
+        const result = await detachProjectSession(undefined, false)
         sendJson(res, result.ok ? 200 : 400, result)
         return
       }
@@ -848,7 +855,7 @@ export function apply(ctx: Context, config: Config): void {
         assertOwnerKey(sessionId)
         const text = typeof body.text === 'string' ? body.text.trim() : ''
         if (!text) throw new HttpBoundaryError('text is required', 400)
-        if (pendingPrompts.has(sessionId)) throw new HttpBoundaryError('session is busy', 409)
+        if (pendingPrompts.has(sessionId) || conversations.busy(sessionId)) throw new HttpBoundaryError('session is busy', 409)
         pendingPrompts.add(sessionId)
         const replay = streamReplay.get(sessionId) ?? new PromptReplay()
         replay.reset()
@@ -872,12 +879,7 @@ export function apply(ctx: Context, config: Config): void {
         const body = await readBody(req)
         const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
         assertOwnerKey(sessionId)
-        creationControllers.get(sessionId)?.abort(new Error('WeChat stop requested'))
-        const handle = agents.get(sessionId)
-        if (handle) {
-          handle.agent.cancel({ kind: 'user' })
-        }
-        sendJson(res, 200, { ok: true })
+        sendJson(res, 200, await conversations.stop(sessionId))
         return
       }
 
@@ -900,12 +902,14 @@ export function apply(ctx: Context, config: Config): void {
         return
       }
 
-      if (req.method === 'POST' && url.pathname === '/api/clear') {
+      if (req.method === 'POST' && (url.pathname === '/api/clear' || url.pathname === '/api/sessions/new')) {
         const body = await readBody(req)
         const sessionId = typeof body.sessionId === 'string' ? body.sessionId : ''
         assertOwnerKey(sessionId)
-        await disposeAgent(sessionId)
-        sendJson(res, 200, { ok: true })
+        const result = url.pathname === '/api/sessions/new'
+          ? await conversations.create(sessionId)
+          : await conversations.clear(sessionId, body.reset === true)
+        sendJson(res, 200, result)
         return
       }
 
